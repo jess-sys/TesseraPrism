@@ -1,0 +1,5 @@
+# Overlay for the `jtag-console` feature: logs over USB-Serial-JTAG, TinyUSB disabled.
+# Use:  ESP_IDF_SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.jtag" cargo build --release --features jtag-console
+CONFIG_TINYUSB_ENABLED=n
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

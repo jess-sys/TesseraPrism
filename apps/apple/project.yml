@@ -1,0 +1,174 @@
+name: Prism
+options:
+  bundleIdPrefix: ch.neutheria
+  deploymentTarget:
+    iOS: "17.0"
+    macOS: "14.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+configFiles:
+  Debug: Local.xcconfig
+  Release: Local.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: $(PRISM_TEAM_ID)
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    # The PrismFFI xcframework only has an arm64 simulator slice.
+    EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+packages:
+  PrismKit:
+    path: PrismKit
+  #FFI PrismFFIKit:
+  #FFI   path: PrismFFIKit
+
+# Lines starting with "#FFI " are enabled by ./generate.sh when ../../crates/prism-ffi/out/PrismFFI.xcframework and
+# PrismFFI.swift exist (linked through the local PrismFFIKit package) (otherwise StubCore is used).
+targets:
+  Prism-iOS:
+    type: application
+    scheme: {}
+    platform: iOS
+    sources:
+      - path: Prism
+        excludes: ["*.entitlements", "Generated/**"]
+      - path: Shared
+    dependencies:
+      - package: PrismKit
+      - target: CredentialProvider-iOS
+        embed: true
+      #FFI - package: PrismFFIKit
+      #FFI   product: PrismFFI
+    info:
+      path: Prism/Generated/Info-iOS.plist
+      properties:
+        CFBundleDisplayName: Prism
+        PrismTeamID: $(DEVELOPMENT_TEAM)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        NSBluetoothAlwaysUsageDescription: Prism connects to your Prism hardware device over Bluetooth.
+        NSCameraUsageDescription: Prism scans QR codes to add one-time-code entries.
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: ch.neutheria.prism.export
+            UTTypeDescription: Prism encrypted export
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [prism]
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Prism export
+            LSItemContentTypes: [ch.neutheria.prism.export]
+            CFBundleTypeRole: Editor
+    entitlements:
+      path: Prism/Prism-iOS.entitlements
+      properties:
+        com.apple.security.application-groups: [group.ch.neutheria.prism]
+        com.apple.developer.authentication-services.autofill-credential-provider: true
+        keychain-access-groups: [$(AppIdentifierPrefix)ch.neutheria.prism.shared]
+    settings:
+      base:
+        PRODUCT_NAME: Prism
+        PRODUCT_BUNDLE_IDENTIFIER: ch.neutheria.prism
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: NO
+
+  Prism-macOS:
+    type: application
+    scheme: {}
+    platform: macOS
+    sources:
+      - path: Prism
+        excludes: ["*.entitlements", "Generated/**"]
+      - path: Shared
+    dependencies:
+      - package: PrismKit
+      - target: CredentialProvider-macOS
+        embed: true
+      #FFI - package: PrismFFIKit
+      #FFI   product: PrismFFI
+    info:
+      path: Prism/Generated/Info-macOS.plist
+      properties:
+        CFBundleDisplayName: Prism
+        PrismTeamID: $(DEVELOPMENT_TEAM)
+        LSApplicationCategoryType: public.app-category.utilities
+        NSBluetoothAlwaysUsageDescription: Prism connects to your Prism hardware device over Bluetooth.
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: ch.neutheria.prism.export
+            UTTypeDescription: Prism encrypted export
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [prism]
+    entitlements:
+      path: Prism/Prism-macOS.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.device.bluetooth: true
+        com.apple.security.files.user-selected.read-write: true
+        com.apple.security.application-groups: [$(TeamIdentifierPrefix)ch.neutheria.prism]
+        com.apple.developer.authentication-services.autofill-credential-provider: true
+        keychain-access-groups: [$(AppIdentifierPrefix)ch.neutheria.prism.shared]
+    settings:
+      base:
+        PRODUCT_NAME: Prism
+        PRODUCT_BUNDLE_IDENTIFIER: ch.neutheria.prism
+        ENABLE_HARDENED_RUNTIME: YES
+        GENERATE_INFOPLIST_FILE: NO
+
+  CredentialProvider-iOS:
+    type: app-extension
+    scheme: {}
+    platform: iOS
+    sources:
+      - path: CredentialProvider
+        excludes: ["Info.plist", "*.entitlements"]
+      - path: Shared
+    dependencies:
+      - package: PrismKit
+      #FFI - package: PrismFFIKit
+      #FFI   product: PrismFFI
+    entitlements:
+      path: CredentialProvider/CredentialProvider-iOS.entitlements
+      properties:
+        com.apple.security.application-groups: [group.ch.neutheria.prism]
+        com.apple.developer.authentication-services.autofill-credential-provider: true
+        keychain-access-groups: [$(AppIdentifierPrefix)ch.neutheria.prism.shared]
+    settings:
+      base:
+        PRODUCT_NAME: CredentialProvider
+        PRODUCT_BUNDLE_IDENTIFIER: ch.neutheria.prism.CredentialProvider
+        INFOPLIST_FILE: CredentialProvider/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SKIP_INSTALL: YES
+
+  CredentialProvider-macOS:
+    type: app-extension
+    scheme: {}
+    platform: macOS
+    sources:
+      - path: CredentialProvider
+        excludes: ["Info.plist", "*.entitlements"]
+      - path: Shared
+    dependencies:
+      - package: PrismKit
+      #FFI - package: PrismFFIKit
+      #FFI   product: PrismFFI
+    entitlements:
+      path: CredentialProvider/CredentialProvider-macOS.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.device.bluetooth: true
+        com.apple.security.application-groups: [$(TeamIdentifierPrefix)ch.neutheria.prism]
+        com.apple.developer.authentication-services.autofill-credential-provider: true
+        keychain-access-groups: [$(AppIdentifierPrefix)ch.neutheria.prism.shared]
+    settings:
+      base:
+        PRODUCT_NAME: CredentialProvider
+        PRODUCT_BUNDLE_IDENTIFIER: ch.neutheria.prism.CredentialProvider
+        INFOPLIST_FILE: CredentialProvider/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_HARDENED_RUNTIME: YES
+        SKIP_INSTALL: YES

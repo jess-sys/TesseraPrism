@@ -1,0 +1,7 @@
+*.xcodeproj
+.build/
+DerivedData/
+PrismKit/.build/
+.swiftpm/
+project.generated.yml
+Prism/Generated/

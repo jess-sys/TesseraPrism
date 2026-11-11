@@ -1,0 +1,37 @@
+[package]
+name = "prism-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host-side client for the Prism hardware password manager (USB CDC + BLE transports, Noise session, typed API)"
+
+[features]
+default = []
+# In-memory FakeDevice (real DeviceSession + UnlockedVault) for tests without hardware.
+fake-device = []
+# Store the host key in the OS keychain instead of ~/.config/prism/host_key.
+keyring = ["dep:keyring"]
+
+[dependencies]
+prism-core.workspace = true
+prism-proto.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "sync", "time", "io-util", "macros", "fs"] }
+tokio-serial = "5"
+btleplug = "0.11"
+futures = "0.3"
+uuid = "1"
+toml = "0.8"
+dirs = "5"
+rand = "0.8"
+hex = "0.4"
+keyring = { version = "3", optional = true, features = ["apple-native", "linux-native", "windows-native"] }
+
+[dev-dependencies]
+prism-client = { path = ".", features = ["fake-device"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"

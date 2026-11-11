@@ -1,0 +1,7 @@
+/target
+/.embuild
+/sdkconfig
+/sdkconfig.old
+/managed_components
+/dependencies.lock
+/components_esp32s3.lock

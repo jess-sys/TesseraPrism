@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="Prism companion: manage your Prism hardware password manager over Bluetooth or USB." />
+    <title>Prism</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpolygon points='8,1 15,14 1,14' fill='%235b5bd6'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a href="#/entries" class="brand" aria-label="Prism home">Prism</a>
+      <nav id="nav" aria-label="Main"></nav>
+      <span id="status" class="status" role="status" aria-live="polite"></span>
+    </header>
+    <main id="app" tabindex="-1"></main>
+    <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

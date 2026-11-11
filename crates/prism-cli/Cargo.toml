@@ -1,0 +1,43 @@
+[package]
+name = "prism-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "`prism` command line companion and SSH agent"
+
+[lib]
+name = "prism_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "prism"
+path = "src/main.rs"
+
+[dependencies]
+prism-core.workspace = true
+prism-proto.workspace = true
+prism-client.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait = "0.1"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+comfy-table = "7"
+rpassword = "7"
+arboard = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+ssh-key = { version = "0.6", features = ["ed25519", "encryption", "std"] }
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+hex = "0.4"
+futures = "0.3"
+dirs = "5"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["process"] }
+prism-client = { workspace = true, features = ["fake-device"] }
+tempfile = "3"
+ed25519-dalek = "2"

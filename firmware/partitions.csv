@@ -1,0 +1,8 @@
+# Name,   Type, SubType,   Offset,   Size,     Flags
+nvs,      data, nvs,       0x9000,   0x6000,
+phy_init, data, phy,       0xf000,   0x1000,
+# Prism vault: 2 x 512 KiB A/B slots, raw access via esp_partition_find_first by label "vault".
+# Subtype is "undefined" (0x06) on purpose: espflash/esp-idf-part panics on custom numeric data subtypes.
+vault,    data, undefined, 0x10000,  0x100000,
+factory,  app,  factory,   0x110000, 0x500000,
+# Room for OTA later: replace "factory" with ota_0/ota_1 + otadata when needed.

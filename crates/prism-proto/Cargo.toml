@@ -1,0 +1,22 @@
+[package]
+name = "prism-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prism-core.workspace = true
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+snow = { version = "0.9", default-features = false, features = ["default-resolver"] }
+blake2 = "0.10"
+getrandom = "0.2"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+proptest = "1"

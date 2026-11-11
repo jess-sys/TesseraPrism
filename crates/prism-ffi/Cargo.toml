@@ -1,0 +1,23 @@
+[package]
+name = "prism-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "UniFFI (Swift) JSON bridge for the Prism host protocol (ARCHITECTURE §9.3)"
+
+[lib]
+name = "prism_ffi"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[dependencies]
+prism-core.workspace = true
+prism-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uniffi = { version = "0.32", features = ["cli"] }

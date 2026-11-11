@@ -1,0 +1,17 @@
+target/
+firmware/target/
+firmware/.embuild/
+node_modules/
+apps/web/dist/
+apps/web/src/wasm/pkg/
+*.xcframework
+apps/apple/*.xcodeproj
+.DS_Store
+crates/prism-ffi/out/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/dependencies.lock.bak
+firmware/target-jtag/
+apps/apple/build/
+apps/apple/build-ios/
+apps/apple/Local.xcconfig
