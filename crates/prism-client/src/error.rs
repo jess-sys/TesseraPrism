@@ -34,7 +34,6 @@ impl Error {
     pub fn from_code(c: ErrorCode) -> Self {
         match c {
             ErrorCode::NotPaired => Error::NotPaired,
-            ErrorCode::Timeout => Error::Timeout,
             c => Error::Device(c),
         }
     }
