@@ -50,20 +50,82 @@ pub struct KdfParams {
 
 impl KdfParams {
     pub const PIN: KdfParams = KdfParams { m_kib: 4096, t: 3, p: 1 };
-    pub const RECOVERY: KdfParams = KdfParams { m_kib: 8192, t: 4, p: 1 };
-    pub const EXPORT: KdfParams = KdfParams { m_kib: 8192, t: 4, p: 1 };
+    /// 4 MiB (fits the device's PSRAM next to everything else) with more passes to compensate.
+    pub const RECOVERY: KdfParams = KdfParams { m_kib: 4096, t: 8, p: 1 };
+    pub const EXPORT: KdfParams = KdfParams { m_kib: 4096, t: 8, p: 1 };
     /// Minimal parameters for fast tests. NEVER use in production.
     pub const TEST: KdfParams = KdfParams { m_kib: 8, t: 1, p: 1 };
 }
 
+/// Largest Argon2 memory (KiB) this process accepts. Parameters come from stored slots and from
+/// imported files, so a crafted file could otherwise request more memory than an embedded device
+/// has (allocation failure aborts). Platforms set it once at startup; default: unlimited.
+static MAX_KDF_MEMORY_KIB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+pub fn set_max_kdf_memory_kib(kib: u32) {
+    MAX_KDF_MEMORY_KIB.store(kib, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Optional pre-allocated Argon2 working memory (1 KiB blocks). Embedded targets reserve it once at
+/// boot, before the heap fragments, so key derivation never needs a large allocation at runtime
+/// (which can fail and abort) and always runs in the same memory. Wiped after every use.
+static KDF_SCRATCH: std::sync::Mutex<Option<Vec<argon2::Block>>> = std::sync::Mutex::new(None);
+
+/// Reserve `blocks` KiB of Argon2 working memory for all later derivations.
+pub fn set_kdf_scratch_blocks(blocks: usize) {
+    *KDF_SCRATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(vec![argon2::Block::default(); blocks]);
+}
+
+/// Compute every derivation twice and only accept agreeing results (embedded targets whose memory
+/// can return bad data under Argon2's load: a corrupted KEK would count a correct PIN as wrong, or
+/// wrap a slot that never opens again). Default off.
+static KDF_VERIFY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_kdf_verify(on: bool) {
+    KDF_VERIFY.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Argon2id(secret, salt) -> 32 bytes.
 pub fn argon2_derive(secret: &[u8], salt: &[u8], params: &KdfParams) -> Result<Zeroizing<[u8; 32]>> {
+    if !KDF_VERIFY.load(core::sync::atomic::Ordering::Relaxed) {
+        return argon2_once(secret, salt, params);
+    }
+    const MAX_RUNS: usize = 8;
+    let mut prev = argon2_once(secret, salt, params)?;
+    for _ in 1..MAX_RUNS {
+        let cur = argon2_once(secret, salt, params)?;
+        if *cur == *prev {
+            return Ok(cur);
+        }
+        prev = cur;
+    }
+    Err(Error::Kdf("unstable hardware: repeated Argon2 runs disagree".into()))
+}
+
+fn argon2_once(secret: &[u8], salt: &[u8], params: &KdfParams) -> Result<Zeroizing<[u8; 32]>> {
+    let max = MAX_KDF_MEMORY_KIB.load(core::sync::atomic::Ordering::Relaxed);
+    if params.m_kib > max {
+        return Err(Error::Kdf(format!("Argon2 memory {} KiB exceeds this device's limit of {max} KiB", params.m_kib)));
+    }
     let p = Params::new(params.m_kib, params.t, params.p, Some(32))
         .map_err(|e| Error::Kdf(e.to_string()))?;
+    let need = p.block_count();
     let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, p);
     let mut out = Zeroizing::new([0u8; 32]);
-    a.hash_password_into(secret, salt, &mut *out)
-        .map_err(|e| Error::Kdf(e.to_string()))?;
+    let mut scratch = KDF_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+    match scratch.as_mut() {
+        Some(buf) if buf.len() >= need => {
+            let r = a.hash_password_into_with_memory(secret, salt, &mut *out, &mut buf[..need]);
+            for b in buf[..need].iter_mut() {
+                zeroize::Zeroize::zeroize(b);
+            }
+            r.map_err(|e| Error::Kdf(e.to_string()))?;
+        }
+        _ => {
+            drop(scratch);
+            a.hash_password_into(secret, salt, &mut *out).map_err(|e| Error::Kdf(e.to_string()))?;
+        }
+    }
     Ok(out)
 }
 

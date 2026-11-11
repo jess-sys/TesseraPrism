@@ -123,6 +123,7 @@ impl UiTask {
                 UiAction::Activity => {
                     let _ = self.power.send(PowerMsg::Activity);
                 }
+                UiAction::InvalidInput => crate::sound::play(crate::sound::Sound::Error),
                 a => {
                     let _ = self.core.send(CoreMsg::Ui(a));
                 }

@@ -7,7 +7,6 @@
 use std::{
     ffi::{c_char, CString},
     sync::{mpsc, OnceLock},
-    thread,
     time::{Duration, Instant},
 };
 
@@ -110,10 +109,8 @@ impl Usb {
         let rc = unsafe { prism_usb_install(serial.as_ptr(), &CBS) };
         anyhow::ensure!(rc == 0, "prism_usb_install failed: {rc}");
 
-        thread::Builder::new()
-            .name("usb".into())
-            .stack_size(8192)
-            .spawn(move || worker(rx, events))?;
+        // PSRAM stack: never touches flash.
+        crate::threads::spawn_psram("usb", 8192, move || worker(rx, events))?;
         log::info!("usb: TinyUSB composite installed (serial {})", serial.to_string_lossy());
         Ok(Usb { tx })
     }

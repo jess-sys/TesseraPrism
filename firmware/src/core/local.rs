@@ -4,7 +4,18 @@
 use std::sync::atomic::Ordering;
 
 use prism_core::model::{Entry, EntryData, EntryKind, SecretField, SecretValue, Settings};
-use prism_core::{totp, Error as CoreError, NoHardening, UnlockedVault};
+use prism_core::{totp, Error as CoreError, KekHardener, NoHardening, UnlockedVault};
+
+use crate::hardening::EfuseHmac;
+
+/// Used when the PIN slot is recorded as hardened but the eFuse key cannot be used: never falls
+/// back to the unhardened KEK (the unlock simply fails).
+struct Unavailable;
+impl KekHardener for Unavailable {
+    fn harden(&self, _k: [u8; 32]) -> [u8; 32] {
+        [0u8; 32]
+    }
+}
 use prism_ui::{DetailField, DetailInfo, TotpView, UiAction, UiEvent};
 use zeroize::Zeroizing;
 
@@ -18,7 +29,7 @@ use crate::transport::TransportCommand;
 impl Core {
     pub(super) fn on_ui_action(&mut self, a: UiAction) {
         match a {
-            UiAction::Activity => {}
+            UiAction::Activity | UiAction::InvalidInput => {} // handled by the UI task
             UiAction::SubmitPin(pin) => self.submit_pin(pin),
             UiAction::SetupPin(pin) => self.setup_pin(pin),
             UiAction::SetupConfirmedSeed => self.setup_confirmed(),
@@ -242,10 +253,29 @@ impl Core {
         if let Err(e) = self.store().set_pin_fails(used) {
             log::error!("pin counter write failed: {e:#}");
         }
-        match UnlockedVault::unlock_with_pin(&bytes, &pin, &NoHardening) {
+        let hardened = self.store().pin_hardened();
+        let result = if hardened {
+            UnlockedVault::unlock_with_pin(&bytes, &pin, &*self.pin_hardener())
+        } else {
+            // Legacy (pre-eFuse) slot; if that fails, the slot may already be hardened (crash between
+            // re-wrapping and recording the flag).
+            match UnlockedVault::unlock_with_pin(&bytes, &pin, &NoHardening) {
+                Err(CoreError::BadCredential) => match EfuseHmac::existing() {
+                    Some(h) => UnlockedVault::unlock_with_pin(&bytes, &pin, &h).inspect(|_| {
+                        let _ = self.store().set_pin_hardened(true);
+                    }),
+                    None => Err(CoreError::BadCredential),
+                },
+                r => r,
+            }
+        };
+        match result {
             Ok(uv) => {
                 let _ = self.store().set_pin_fails(0);
                 self.finish_unlock(uv);
+                if !self.store().pin_hardened() {
+                    self.harden_pin_slot(&pin);
+                }
             }
             Err(CoreError::BadCredential) => {
                 if used >= MAX_PIN_FAILS {
@@ -256,10 +286,63 @@ impl Core {
                     self.ui(UiEvent::PinRejected { attempts_left: MAX_PIN_FAILS - used });
                 }
             }
+            Err(CoreError::Kdf(e)) => {
+                // Not a wrong PIN: the key derivation could not produce a stable result.
+                log::error!("unlock: {e}");
+                let _ = self.store().set_pin_fails(fails);
+                self.ui(UiEvent::Message { text: "Hardware glitch while checking the PIN (not counted as a wrong PIN). Please try again.".into(), error: true });
+            }
             Err(e) => {
                 log::error!("unlock failed: {e}");
                 let _ = self.store().set_pin_fails(fails);
                 self.ui(UiEvent::Message { text: "Vault is corrupt or unsupported.".into(), error: true });
+            }
+        }
+    }
+
+    /// KEK hardener for the PIN slot as currently stored.
+    pub(super) fn pin_hardener(&self) -> Box<dyn KekHardener> {
+        if !self.store().pin_hardened() {
+            return Box::new(NoHardening);
+        }
+        match EfuseHmac::existing() {
+            Some(h) => Box::new(h),
+            None => {
+                log::error!("PIN slot is eFuse-hardened but no HMAC key block was found");
+                Box::new(Unavailable)
+            }
+        }
+    }
+
+    /// One-time migration: provision the eFuse HMAC key if needed and re-wrap the PIN slot with the
+    /// hardened KEK. Order matters: persist the re-wrapped vault, THEN record the flag (unlock
+    /// tolerates a crash in between). Failures leave the legacy slot working.
+    fn harden_pin_slot(&mut self, pin: &str) {
+        let h = match EfuseHmac::existing_or_provision().and_then(|h| h.check().map(|_| h)) {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!("eFuse PIN hardening unavailable: {e:#}");
+                self.ui(UiEvent::Message { text: format!("Hardware PIN protection could not be enabled: {e:#}"), error: true });
+                return;
+            }
+        };
+        let Some(v) = self.vault.as_mut() else { return };
+        if let Err(e) = v.change_pin(pin, &h, &mut self.rng) {
+            log::error!("re-wrapping the PIN slot failed: {e}");
+            return;
+        }
+        match self.persist() {
+            Ok(()) => {
+                let _ = self.store().set_pin_hardened(true);
+                log::info!("PIN slot is now bound to the eFuse HMAC key");
+                self.ui(UiEvent::Message {
+                    text: "Your PIN is now bound to this device's secure hardware: a copy of the flash can no longer be used to guess it.".into(),
+                    error: false,
+                });
+            }
+            Err(e) => {
+                log::error!("saving the hardened PIN slot failed: {e:?}");
+                self.ui(UiEvent::Message { text: "Hardware PIN protection could not be saved; will retry next unlock.".into(), error: true });
             }
         }
     }
@@ -270,7 +353,19 @@ impl Core {
         if self.initialized {
             return;
         }
-        match UnlockedVault::create(&pin, &NoHardening, &mut self.rng) {
+        let hw = match EfuseHmac::existing_or_provision().and_then(|h| h.check().map(|_| h)) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                log::error!("eFuse PIN hardening unavailable, creating an unhardened PIN slot: {e:#}");
+                None
+            }
+        };
+        self.setup_hardened = hw.is_some();
+        let hardener: &dyn KekHardener = match &hw {
+            Some(h) => h,
+            None => &NoHardening,
+        };
+        match UnlockedVault::create(&pin, hardener, &mut self.rng) {
             Ok((uv, mnemonic)) => {
                 let words: Vec<String> = mnemonic.words().into_iter().map(String::from).collect();
                 self.setup = Some(uv);
@@ -298,6 +393,7 @@ impl Core {
             return;
         }
         self.initialized = true;
+        let _ = self.store().set_pin_hardened(self.setup_hardened);
         let _ = self.store().set_pin_fails(0);
         let s = self.settings.clone();
         let _ = self.store().set_settings(&s);

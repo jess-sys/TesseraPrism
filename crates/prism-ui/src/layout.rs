@@ -281,7 +281,7 @@ fn dots_for_pin(sz: Size, len: usize) -> Item {
     Item::Dots { cx, cy, total: len.max(6), filled: len }
 }
 
-fn keypad(sz: Size, digits: &[u8; 10], len: usize, min: usize) -> Vec<Item> {
+fn keypad(sz: Size, digits: &[u8; 10], _len: usize, _min: usize) -> Vec<Item> {
     let (ax, ay, aw, ah) = if land(sz) { (500, 56, 436, 468) } else { (24, 340, 492, 584) };
     let gap = 12;
     let cw = (aw - 2 * gap) / 3;
@@ -292,7 +292,8 @@ fn keypad(sz: Size, digits: &[u8; 10], len: usize, min: usize) -> Vec<Item> {
             let r_ = rect(ax + c * (cw + gap), ay + r * (ch + gap), cw as u32, ch as u32);
             let btn = match (r, c) {
                 (3, 0) => Btn::new(r_, Id::Del, "Del", Style::Outline).font(F::Bold),
-                (3, 2) => Btn::new(r_, Id::Ok, "OK", Style::Primary).font(F::Title).enabled(len >= min),
+                // Always enabled: flipping it at the minimum length forced a greyscale refresh mid-typing.
+                (3, 2) => Btn::new(r_, Id::Ok, "OK", Style::Primary).font(F::Title),
                 (3, 1) => Btn::new(r_, Id::Digit(digits[9]), &digits[9].to_string(), Style::Outline).font(F::Big),
                 _ => {
                     let d = digits[(r * 3 + c) as usize];

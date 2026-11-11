@@ -199,7 +199,7 @@ and through the iOS/macOS AutoFill provider, auto-lock and power-off.
 
 Known gaps and next steps:
 
-- **Production hardening is not enabled by default.** Development builds have no flash
+- **Hardware-bound PIN is on** (eFuse HMAC key, generated on the device). **Flash encryption and secure boot are not enabled yet** ([roadmap](docs/plans/hardware-security.md)): development builds have no flash
   encryption or secure boot; see the (irreversible) procedure in [docs/SECURITY.md](docs/SECURITY.md).
 - FIDO2 credential management (listing / deleting passkeys from the OS) is not implemented yet.
 - No microSD backup and no on-device entry editing yet.

@@ -655,13 +655,13 @@ impl Ui {
                         p.entry.pop();
                         self.pin_dirty();
                     }
-                    Id::Ok
-                        if p.entry.len() >= min => {
-                            let pin = Zeroizing::new(p.entry.to_string());
-                            p.entry.clear();
-                            out.push(UiAction::SubmitPin(pin));
-                            self.pin_dirty();
-                        }
+                    Id::Ok if p.entry.len() >= min => {
+                        let pin = Zeroizing::new(p.entry.to_string());
+                        p.entry.clear();
+                        out.push(UiAction::SubmitPin(pin));
+                        self.pin_dirty();
+                    }
+                    Id::Ok => out.push(UiAction::InvalidInput),
                     _ => {}
                 }
                 return;
@@ -882,30 +882,10 @@ impl Ui {
         }
     }
 
-    fn pin_entry_len(&self) -> usize {
-        match &self.screen {
-            Screen::Pin(p) => p.entry.len(),
-            Screen::Setup(s) => s.entry.len(),
-            _ => 0,
-        }
-    }
-
     fn pin_dirty(&mut self) {
         let sz = self.size();
         // Dots are pure black/white: DU-safe fast refresh.
         self.fast(pin_feedback_rect(sz));
-        // OK flips between disabled (grey) and enabled around the minimum length: greyscale
-        // refresh of just that key when it may have changed.
-        let min = match &self.screen {
-            Screen::Setup(_) => MIN_SETUP_PIN,
-            _ => MIN_PIN,
-        };
-        let len = self.pin_entry_len();
-        if len == min || len + 1 == min {
-            if let Some(b) = self.buttons().into_iter().find(|b| b.id == Id::Ok) {
-                self.partial(b.rect);
-            }
-        }
     }
 
     // ---- setup wizard ----------------------------------------------------
@@ -965,7 +945,8 @@ impl Ui {
                         s.entry.pop();
                         self.pin_dirty();
                     }
-                    Id::Ok if s.entry.len() >= MIN_SETUP_PIN => {
+                    Id::Ok if s.entry.len() < MIN_SETUP_PIN => out.push(UiAction::InvalidInput),
+                    Id::Ok => {
                         if s.step == SetupStep::ChoosePin {
                             s.first = Zeroizing::new(s.entry.to_string());
                             s.entry.clear();

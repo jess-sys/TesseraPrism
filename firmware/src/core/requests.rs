@@ -17,7 +17,7 @@ use prism_core::model::{
     ApprovalPolicy, Entry, EntryData, EntryId, ImportMode, Passkey, SecretField, SecretValue, SshKeySource,
 };
 use prism_core::slots::KdfParams;
-use prism_core::{totp, Error as CoreError, NoHardening, UnlockedVault};
+use prism_core::{totp, Error as CoreError, UnlockedVault};
 use prism_ctap::{PresenceKind, PresenceResult, StorageError};
 use prism_proto::{ErrorCode, Request, Response};
 use prism_ui::{ApprovalKind, ApprovalRequest, UiEvent};
@@ -291,7 +291,7 @@ impl Core {
 
     // ---- execution ---------------------------------------------------------------------------
 
-    fn persist(&mut self) -> Result<(), ErrorCode> {
+    pub(super) fn persist(&mut self) -> Result<(), ErrorCode> {
         let Some(v) = self.vault.as_mut() else { return Err(ErrorCode::Locked) };
         let bytes = v.seal(&mut self.rng).map_err(|e| {
             log::error!("seal failed: {e}");
@@ -509,11 +509,39 @@ impl Core {
                 R::Ok
             }
             SetRecoveryPassphrase { passphrase } => {
+                diag_fingerprint("set recovery", &passphrase);
                 let v = self.vault.as_mut()?;
                 match v.set_recovery_passphrase(&passphrase, &mut self.rng) {
-                    Ok(()) => Self::ok_or_err(self.persist()),
-                    Err(CoreError::Invalid(_)) => R::Error(ErrorCode::InvalidRequest),
-                    Err(_) => R::Error(ErrorCode::Internal),
+                    Ok(()) => {}
+                    Err(CoreError::Invalid(_)) => return err(ErrorCode::InvalidRequest),
+                    Err(e) => {
+                        log::error!("set recovery passphrase: {e}");
+                        return err(ErrorCode::Internal);
+                    }
+                }
+                if let Err(c) = self.persist() {
+                    return err(c);
+                }
+                // Never leave a recovery slot that doesn't open: verify against what was stored.
+                let verified = match self.vault_store.load() {
+                    Some(b) => match UnlockedVault::unlock_with_passphrase(&b, &passphrase) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            log::error!("recovery passphrase verification against flash failed: {e}");
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                if verified {
+                    R::Ok
+                } else {
+                    kdf_selftest();
+                    if let Some(v) = self.vault.as_mut() {
+                        v.remove_recovery_passphrase();
+                    }
+                    let _ = self.persist();
+                    R::Error(ErrorCode::Internal)
                 }
             }
             // Handled before `exec_unlocked`.
@@ -572,11 +600,15 @@ impl Core {
 
     fn do_export(&mut self, passphrase: String) -> Response {
         let passphrase = Zeroizing::new(passphrase);
+        diag_fingerprint("export", &passphrase);
         let Some(bytes) = self.vault_store.load() else { return Response::Error(ErrorCode::NotFound) };
         // Proves the caller knows the recovery passphrase (and that the slot exists).
         match UnlockedVault::unlock_with_passphrase(&bytes, &passphrase) {
             Ok(check) => drop(check),
-            Err(CoreError::BadCredential) => return Response::Error(ErrorCode::BadPassphrase),
+            Err(CoreError::BadCredential) => {
+                log::warn!("export: recovery passphrase rejected ({} stored bytes)", bytes.len());
+                return Response::Error(ErrorCode::BadPassphrase);
+            }
             Err(CoreError::NoSlot) => return Response::Error(ErrorCode::Unsupported),
             Err(_) => return Response::Error(ErrorCode::Internal),
         }
@@ -749,14 +781,15 @@ impl Core {
         let fails = self.store().pin_fails();
         let used = fails.saturating_add(1);
         let _ = self.store().set_pin_fails(used);
-        match UnlockedVault::unlock_with_pin(&bytes, pin, &NoHardening) {
+        let hardener = self.pin_hardener();
+        match UnlockedVault::unlock_with_pin(&bytes, pin, &*hardener) {
             Ok(check) => {
                 drop(check);
                 let _ = self.store().set_pin_fails(0);
                 let Some(p) = self.pending_replace.take() else { return };
                 let resp = match self.vault.as_mut() {
                     None => Response::Error(ErrorCode::Locked),
-                    Some(v) => match v.replace_contents(p.seed, p.vault, pin, &NoHardening, &mut self.rng) {
+                    Some(v) => match v.replace_contents(p.seed, p.vault, pin, &*hardener, &mut self.rng) {
                         Ok(()) => {
                             self.session_approved.clear();
                             Self::ok_or_err(self.persist())
@@ -810,3 +843,27 @@ pub(super) fn totp_ref(e: &Entry) -> Option<&prism_core::model::Totp> {
 
 #[allow(dead_code)]
 fn _unused(_: SshKeySource, _: PowerMsg) {}
+
+/// Diagnostics: Argon2 with the recovery parameters must be deterministic on this hardware.
+pub(crate) fn kdf_selftest() {
+    let p = prism_core::slots::KdfParams::RECOVERY;
+    let a = prism_core::slots::argon2_derive(b"prism-selftest", &[7u8; 16], &p);
+    let b = prism_core::slots::argon2_derive(b"prism-selftest", &[7u8; 16], &p);
+    match (a, b) {
+        (Ok(a), Ok(b)) => log::error!(
+            "KDF self-test ({} KiB, t={}): deterministic={} [{:02x}{:02x}.. vs {:02x}{:02x}..]",
+            p.m_kib, p.t, *a == *b, a[0], a[1], b[0], b[1]
+        ),
+        (a, b) => log::error!("KDF self-test failed to run: {:?} / {:?}", a.err(), b.err()),
+    }
+}
+
+/// Diagnostic build only: non-reversible fingerprint (first 4 bytes of SHA-256 + length) of a
+/// passphrase, to compare what two requests carried without logging the secret.
+fn diag_fingerprint(what: &str, pass: &str) {
+    if cfg!(feature = "jtag-console") {
+        use sha2::Digest;
+        let h = sha2::Sha256::digest(pass.as_bytes());
+        log::warn!("{what}: passphrase fp {:02x}{:02x}{:02x}{:02x} len {}", h[0], h[1], h[2], h[3], pass.len());
+    }
+}

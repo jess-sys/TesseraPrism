@@ -33,6 +33,7 @@ jtag-console = []
 jtag-real-off = []
 
 [dependencies]
+sha2 = "0.10"
 esp-idf-svc = { version = "0.53", default-features = true }
 esp-idf-hal = "0.47"
 esp-idf-sys = { version = "0.38", features = ["binstart"] }

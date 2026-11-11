@@ -11,6 +11,7 @@
 mod board;
 mod core;
 mod drivers;
+mod hardening;
 mod power_mgr;
 mod sound;
 mod storage;
@@ -105,6 +106,15 @@ fn reset_reason_name(r: sys::esp_reset_reason_t) -> &'static str {
 
 fn run() -> Result<()> {
     check_psram()?;
+    // Argon2 parameters come from stored slots and imported files: refuse anything that would not
+    // fit in PSRAM (an allocation failure would abort the firmware).
+    prism_core::slots::set_max_kdf_memory_kib(4096);
+    // Reserve Argon2's 4 MiB working memory now, before the framebuffers/BLE fragment PSRAM.
+    prism_core::slots::set_kdf_scratch_blocks(4096);
+    // This board's PSRAM occasionally returns bad data under Argon2's random-access load (verified on
+    // hardware: identical inputs, differing outputs). Accept a derivation only when two runs agree.
+    prism_core::slots::set_kdf_verify(true);
+    threads::log_heap("kdf scratch reserved");
 
     // ---- persistent storage ----
     let nvs_part = EspDefaultNvsPartition::take().context("NVS partition")?;
@@ -215,7 +225,7 @@ fn run() -> Result<()> {
     {
         let tx = core_tx.clone();
         let events = th.events;
-        std::thread::Builder::new().name("tp-fwd".into()).stack_size(4096).spawn(move || {
+        threads::spawn_psram("tp-fwd", 4096, move || {
             while let Ok(ev) = events.recv() {
                 if tx.send(CoreMsg::Transport(ev)).is_err() {
                     break;

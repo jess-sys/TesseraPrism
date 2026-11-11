@@ -150,13 +150,14 @@ fn pin_flow() {
     ui.handle(UiEvent::BootComplete { initialized: true });
     assert_eq!(ui.screen_name(), "pin");
     render(&ui, "02_pin_empty");
-    // OK disabled below min length
-    assert!(ui.targets().iter().all(|(n, _)| n != "Ok"));
+    // OK always shown; below the minimum length it only signals invalid input
+    let acts = tap(&mut ui, "Ok");
+    assert!(acts.iter().any(|a| matches!(a, UiAction::InvalidInput)));
     let _ = ui.refresh_hint();
     type_pin(&mut ui, "2468");
     let fb = render(&ui, "03_pin_entered");
     assert!(fb.dark_pixels() > 1000);
-    assert!(matches!(ui.peek_refresh_hint(), Some(RefreshMode::Partial(_))));
+    assert!(matches!(ui.peek_refresh_hint(), Some(RefreshMode::Fast(_))));
     let acts = tap(&mut ui, "Ok");
     let pin = acts.iter().find_map(|a| if let UiAction::SubmitPin(p) = a { Some(p.clone()) } else { None }).expect("SubmitPin");
     assert_eq!(&**pin, "2468");
@@ -455,8 +456,10 @@ fn setup_wizard_happy_path() {
     ui.handle(UiEvent::BootComplete { initialized: false });
     assert_eq!(ui.setup_step(), Some(SetupStep::ChoosePin));
     render(&ui, "40_setup_choose_pin");
-    type_pin(&mut ui, "12345"); // too short: OK disabled
-    assert!(!ui.targets().iter().any(|t| t.0 == "Ok"));
+    type_pin(&mut ui, "12345"); // too short: OK only signals invalid input
+    let acts = tap(&mut ui, "Ok");
+    assert!(acts.iter().any(|a| matches!(a, UiAction::InvalidInput)));
+    assert_eq!(ui.setup_step(), Some(SetupStep::ChoosePin));
     type_pin(&mut ui, "6");
     tap(&mut ui, "Ok");
     assert_eq!(ui.setup_step(), Some(SetupStep::ConfirmPin));
@@ -696,10 +699,10 @@ fn pin_digit_registers_on_touch_down_with_fast_refresh() {
         type_pin(&mut ui, "1");
         assert!(!matches!(ui.refresh_hint(), RefreshMode::Full));
     }
-    // Reaching the minimum length also refreshes the (greyscale) OK key.
+    // Reaching the minimum length no longer triggers a greyscale refresh (OK is always enabled).
     tap(&mut ui, "Del");
     type_pin(&mut ui, "123");
     let _ = ui.refresh_hint();
     type_pin(&mut ui, "4");
-    assert!(matches!(ui.peek_refresh_hint(), Some(RefreshMode::Partial(_))));
+    assert!(matches!(ui.peek_refresh_hint(), Some(RefreshMode::Fast(_))));
 }

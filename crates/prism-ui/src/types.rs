@@ -142,6 +142,8 @@ pub enum UiEvent {
 }
 
 pub enum UiAction {
+    /// Input rejected locally (e.g. OK with a too-short PIN): give feedback (error beep).
+    InvalidInput,
     /// Any user interaction (reset idle timer).
     Activity,
     SubmitPin(Zeroizing<String>),

@@ -171,6 +171,8 @@ const K_LAST_USED: &str = "last_used";
 const K_BAT_SHUT: &str = "bat_shut";
 /// Shutdown breadcrumb (diagnostics): last stage reached by the power-off sequence.
 const K_SHUT_STAGE: &str = "shut_stage";
+/// The vault PIN slot is wrapped with the eFuse HMAC-hardened KEK (see hardening.rs).
+const K_PIN_HW: &str = "pin_hw";
 
 impl Store {
     pub fn open(partition: EspDefaultNvsPartition) -> Result<Self> {
@@ -266,6 +268,15 @@ impl Store {
         Ok(())
     }
 
+    pub fn pin_hardened(&self) -> bool {
+        self.nvs.get_u8(K_PIN_HW).ok().flatten() == Some(1)
+    }
+
+    pub fn set_pin_hardened(&mut self, on: bool) -> Result<()> {
+        self.nvs.set_u8(K_PIN_HW, on as u8).map_err(|e| anyhow!("nvs set pin_hw: {e}"))?;
+        Ok(())
+    }
+
     /// Last shutdown stage written before power was cut (0 = none / cleared).
     pub fn shutdown_stage(&self) -> u8 {
         self.nvs.get_u8(K_SHUT_STAGE).ok().flatten().unwrap_or(0)
@@ -278,7 +289,7 @@ impl Store {
 
     /// Reset everything except the device identity key.
     pub fn wipe(&mut self) -> Result<()> {
-        for k in [K_HOSTS, K_PIN_FAIL, K_SETTINGS, K_LAST_USED, K_BAT_SHUT] {
+        for k in [K_HOSTS, K_PIN_FAIL, K_SETTINGS, K_LAST_USED, K_BAT_SHUT, K_PIN_HW] {
             let _ = self.nvs.remove(k);
         }
         Ok(())

@@ -3,3 +3,6 @@
 CONFIG_TINYUSB_ENABLED=n
 CONFIG_ESP_CONSOLE_UART_DEFAULT=n
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Diagnostics: test the whole PSRAM at boot (disabled in the normal build for boot speed).
+CONFIG_SPIRAM_MEMTEST=y
+

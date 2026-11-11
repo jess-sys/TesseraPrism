@@ -90,7 +90,7 @@ mod layouts;
 #[cfg(not(feature = "jtag-console"))]
 mod usb;
 
-use std::{sync::mpsc, thread};
+use std::sync::mpsc;
 
 /// Start the transport layer: brings up BLE and/or USB per `config`, spawns the worker threads and
 /// returns the event/command channels. Never blocks after start-up.
@@ -116,7 +116,7 @@ pub fn start(config: TransportConfig) -> anyhow::Result<TransportHandles> {
         log::warn!("transport: USB disabled (jtag-console feature keeps USB for logs)");
     }
 
-    thread::Builder::new().name("transport-cmd".into()).stack_size(6144).spawn(move || {
+    crate::threads::spawn_psram("transport-cmd", 6144, move || {
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
                 TransportCommand::PrismFrame { link: Link::Ble { conn, chan }, frame } => match &ble {

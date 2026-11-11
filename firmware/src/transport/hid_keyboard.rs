@@ -22,7 +22,7 @@ pub struct TypeJob {
 /// Spawn the typing thread.
 pub fn spawn() -> anyhow::Result<mpsc::Sender<TypeJob>> {
     let (tx, rx) = mpsc::channel::<TypeJob>();
-    thread::Builder::new().name("hid-kbd".into()).stack_size(6144).spawn(move || {
+    crate::threads::spawn_psram("hid-kbd", 6144, move || {
         while let Ok(job) = rx.recv() {
             type_text(&job.text, job.layout);
         }

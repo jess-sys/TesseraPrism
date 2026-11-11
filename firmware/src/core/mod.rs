@@ -9,7 +9,7 @@ pub mod clock;
 pub mod ctap;
 mod local;
 pub mod msg;
-mod requests;
+pub(crate) mod requests;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -133,6 +133,8 @@ pub struct Core {
     transfer_owner: Option<Link>,
     /// The "still waiting" reminder sound was played for the active approval.
     approval_reminded: bool,
+    /// The vault being set up uses the eFuse-hardened PIN slot.
+    setup_hardened: bool,
     pending_replace: Option<PendingReplace>,
     /// Consecutive wrong recovery passphrases over the wire; throttles guessing.
     pp_fails: u8,
@@ -189,6 +191,7 @@ pub fn start(
         export: None,
         transfer_owner: None,
         approval_reminded: false,
+        setup_hardened: false,
         pending_replace: None,
         pp_fails: 0,
         pp_locked_until: None,

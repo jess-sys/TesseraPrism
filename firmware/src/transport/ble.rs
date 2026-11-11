@@ -368,10 +368,8 @@ impl Ble {
         // ---- TX worker -------------------------------------------------------------------------
         {
             let sh = shared.clone();
-            thread::Builder::new()
-                .name("ble-tx".into())
-                .stack_size(8192)
-                .spawn(move || worker(sh, out_rx, prism_tx, fido_status))?;
+            // PSRAM stack: never touches flash.
+            crate::threads::spawn_psram("ble-tx", 8192, move || worker(sh, out_rx, prism_tx, fido_status))?;
         }
         let _ = shared.out.send(Out::Advertising);
         log::info!("ble: started as {:?}", config.ble_name);

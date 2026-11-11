@@ -1656,6 +1656,7 @@ dependencies = [
  "prism-ui",
  "rand_core",
  "serde",
+ "sha2",
  "zeroize",
 ]
 

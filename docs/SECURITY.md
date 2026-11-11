@@ -9,6 +9,11 @@
 * Seed-derived keys (SSH, passkey private keys, export subkeys) are re-derived on demand and never stored.
 * The unlocked vault lives only in RAM (PSRAM) and is zeroized on lock.
 * The PIN failure counter lives in NVS, outside the vault. After 10 consecutive failures the vault is wiped.
+* **Hardware-bound PIN (implemented, on by default):** the PIN slot's KEK is
+  `HMAC-SHA256(efuse_key, Argon2id(pin))`, computed by the ESP32-S3 HMAC peripheral with a key generated
+  on the device and burned into a read-protected eFuse block (`HMAC_UP`). See "How `KekHardener` uses the
+  eFuse key" below. Flash encryption and secure boot are **not** enabled yet (§3, roadmap in
+  [plans/hardware-security.md](plans/hardware-security.md)).
 * Every secret use is gated by a per-entry approval policy (`Always` / `Session` / `Never`) requiring a
   physical tap on the device.
 
@@ -93,6 +98,12 @@ guesses off-chip: each guess requires the chip. The recovery slot deliberately d
 recovery passphrase / 24 words restore a vault on a replacement device. Consequently, in the prod profile the
 recovery passphrase must be strong (it is the offline-attackable path): use 6+ random words.
 
-A vault created with `NoHardening` (dev) is not readable once the prod hardener is active. Migrate by exporting
-(`.prism`) in dev, provisioning prod, and importing, or by running `change_pin` with the real hardener after
-unlocking with the recovery slot.
+**As implemented** (`firmware/src/hardening.rs`): the firmware provisions the key itself. The first time a PIN
+slot is created (setup) or migrated (first unlock of an older vault), it fills 32 bytes from the hardware RNG
+(radio on), burns them with `esp_efuse_write_key(<first unused key block>, HMAC_UP, …)` — irreversible, one key
+block consumed — checks the block is read-protected and self-tests the HMAC peripheral, then re-wraps the PIN
+slot with `change_pin`. The key never exists outside the chip (there is no `hmac_key.bin`; step 3 of §3 is not
+needed). An NVS flag (`pin_hw`) records that the slot is hardened; it is written *after* the re-wrapped vault is
+persisted, and unlock also tries the eFuse key when the flag is missing, so a crash mid-migration cannot lock
+the user out. If the peripheral is unusable the KEK fails closed (the unlock fails; it never falls back to the
+unhardened key). A wipe clears the flag; the eFuse key is kept and reused.
