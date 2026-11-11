@@ -75,7 +75,9 @@ fn draw_item<D: DrawTarget<Color = Gray4>>(d: &mut D, it: &Item, pressed: Option
             }
         }
         Item::Digits { s, cx, cy, font, split } => draw_digits(d, s, *cx, *cy, *font, *split, map(INK, inv)),
-        Item::Brand { cx, cy, large } => draw_brand(d, *cx, *cy, *large),
+        Item::Brand { cx, cy, large, inverted } => draw_brand(d, *cx, *cy, *large, *inverted),
+        Item::IconC { kind, rect, fg, bg } => draw_icon(d, *kind, *rect, *fg, *bg),
+        Item::Battery { x, cy, pct, fg, bg } => draw_battery(d, *x, *cy, *pct, *fg, *bg),
         Item::Status(st) => draw_status(d, st),
     }
 }
@@ -246,6 +248,10 @@ pub fn draw_icon<D: DrawTarget<Color = Gray4>>(d: &mut D, kind: Icon, r: Rectang
             line(d, p(32, 40), p(46, 56), t, bg);
             line(d, p(46, 56), p(70, 30), t, bg);
         }
+        Icon::Arrow => {
+            line(d, p(5, 50), p(70, 50), t, fg);
+            let _ = Triangle::new(p(58, 20), p(58, 80), p(98, 50)).into_styled(PrimitiveStyle::with_fill(fg)).draw(d);
+        }
         Icon::Power => {
             ring(d, p(50, 55), (s * 70 / 100) as u32, t, fg);
             fill(d, Rectangle::new(p(0, 0), Size::new(s as u32, (s * 40 / 100) as u32)).intersection(&Rectangle::new(p(38, 0), Size::new((s * 24 / 100) as u32, (s * 40 / 100) as u32))), bg);
@@ -258,11 +264,27 @@ const BRAND_480: &[u8] = include_bytes!("../assets/neutheria-systems-480x30.gray
 const BRAND_360: &[u8] = include_bytes!("../assets/neutheria-systems-360x22.gray4");
 
 /// Neutheria Systems wordmark (pre-rendered Gray4 bitmap, see `examples/gen_logo.rs`).
-pub fn draw_brand<D: DrawTarget<Color = Gray4>>(d: &mut D, cx: i32, cy: i32, large: bool) {
-    use embedded_graphics::image::{Image, ImageRaw};
-    let (data, w, h) = if large { (BRAND_480, 480, 30) } else { (BRAND_360, 360, 22) };
+pub fn draw_brand<D: DrawTarget<Color = Gray4>>(d: &mut D, cx: i32, cy: i32, large: bool, inverted: bool) {
+    use embedded_graphics::image::{GetPixel, ImageRaw};
+    let (data, w, h) = if large { (BRAND_480, 480u32, 30u32) } else { (BRAND_360, 360, 22) };
     let raw: ImageRaw<Gray4> = ImageRaw::new(data, w);
-    let _ = Image::new(&raw, Point::new(cx - w as i32 / 2, cy - h / 2)).draw(d);
+    let (x0, y0) = (cx - w as i32 / 2, cy - h as i32 / 2);
+    let px = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).filter_map(|(x, y)| {
+        let c = raw.pixel(Point::new(x as i32, y as i32))?;
+        let c = if inverted { Gray4::new(15 - c.luma()) } else { c };
+        Some(Pixel(Point::new(x0 + x as i32, y0 + y as i32), c))
+    });
+    let _ = d.draw_iter(px);
+}
+
+/// Battery gauge 46x22 (left edge x, centred on cy).
+pub fn draw_battery<D: DrawTarget<Color = Gray4>>(d: &mut D, x: i32, cy: i32, pct: u8, fg: Gray4, bg: Gray4) {
+    let y = cy - 11;
+    stroke(d, rect(x, y, 42, 22), 3, fg);
+    fill(d, rect(x + 42, y + 6, 4, 10), fg);
+    fill(d, rect(x + 3, y + 3, 36, 16), bg);
+    let inner = (34 * pct.min(100) as i32 / 100) as u32;
+    fill(d, rect(x + 4, y + 4, inner, 14), fg);
 }
 
 fn draw_status<D: DrawTarget<Color = Gray4>>(d: &mut D, st: &Status) {

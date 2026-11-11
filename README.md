@@ -89,6 +89,21 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (the protocol contract) an
 
 ## Getting started
 
+### Pre-built downloads
+
+Every push to `main` refreshes the [nightly pre-release](https://github.com/jess-sys/TesseraPrism/releases/tag/nightly);
+version tags (`v*`) publish regular [releases](https://github.com/jess-sys/TesseraPrism/releases). Each one contains:
+
+| File | What |
+|---|---|
+| `prism-firmware-<ver>.bin` | Merged flash image (bootloader + partitions + app) for the Paper S3 |
+| `prism-cli-<ver>-<target>.tar.gz` | `prism` CLI + SSH agent for Linux x86_64 and macOS Apple Silicon |
+| `prism-web-<ver>.zip` | Static web companion (serve over HTTPS for Web Bluetooth) |
+| `SHA256SUMS.txt` | Checksums |
+
+Flash the image with the board in download mode (hold BOOT while powering on):
+`espflash write-bin 0x0 prism-firmware-<ver>.bin`.
+
 ### Hardware
 
 An **M5Stack Paper S3** (ESP32-S3R8, 8 MB PSRAM, 16 MB flash, 960×540 e-ink, GT911 touch,

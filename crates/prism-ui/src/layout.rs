@@ -64,8 +64,9 @@ pub enum Icon {
     Gear,
     Lock,
     Shield,
-    #[allow(dead_code)] // kept for a future "power" affordance
     Power,
+    /// Arrow pointing right (towards the power button on the lock screen).
+    Arrow,
 }
 
 #[derive(Clone, Debug)]
@@ -109,7 +110,12 @@ pub enum Item {
     Bar { rect: Rectangle, segs: u32, filled: u32 },
     Digits { s: String, cx: i32, cy: i32, font: F, split: usize },
     /// "NEUTHERIA SYSTEMS" wordmark, centred on (cx, cy). `large`: 480 px wide, else 360 px.
-    Brand { cx: i32, cy: i32, large: bool },
+    /// `inverted`: white on black.
+    Brand { cx: i32, cy: i32, large: bool, inverted: bool },
+    /// Icon with explicit colours (e.g. white on a black band).
+    IconC { kind: Icon, rect: Rectangle, fg: Gray4, bg: Gray4 },
+    /// Battery gauge (46x22) with its left edge at x, vertically centred on cy.
+    Battery { x: i32, cy: i32, pct: u8, fg: Gray4, bg: Gray4 },
     Status(Status),
 }
 
@@ -348,37 +354,15 @@ impl Ui {
         match screen {
             Screen::Splash => {
                 let (cx, cy) = (w / 2, if l { 190 } else { 380 });
-                v.push(Item::Brand { cx, cy, large: true });
+                v.push(Item::Brand { cx, cy, large: true, inverted: false });
                 v.push(txt("Tessera Prism", cx, cy + 80, F::Big, Align::Center, INK));
                 v.push(txt("Hardware password manager", cx, cy + 140, F::Body, Align::Center, DIM));
                 v.push(txt(format!("Battery {}%", self.status.battery), cx, h - 50, F::Small, Align::Center, DIM));
             }
             Screen::Lock { battery, last_used } => {
-                let (lx, tx, cy) = if l { (230, 700, 240) } else { (w / 2, w / 2, 170) };
-                v.push(Item::Brand { cx: lx, cy, large: !l });
-                v.push(txt("Tessera Prism", lx, cy + 66, F::Title, Align::Center, INK));
-                let mut y = if l { 130 } else { 360 };
-                v.push(txt("Locked", tx, y, F::Big, Align::Center, INK));
-                y += 80;
-                v.push(txt(format!("Battery at shutdown: {battery}%"), tx, y, F::Body, Align::Center, INK));
-                y += 46;
-                let lu = match last_used {
-                    Some(t) => format!("Last used: {}", fmt_datetime(*t, self.status.tz_secs)),
-                    None => "Last used: never".to_string(),
-                };
-                v.push(txt(lu, tx, y, F::Body, Align::Center, DIM));
-                y += 66;
-                if let Some(info) = &self.settings.owner_info {
-                    let lines = wrap(F::Body, info, if l { 420 } else { 440 }, 3);
-                    let bh = 30 + lines.len() as i32 * 34;
-                    v.push(Item::Frame { rect: rect(tx - 230, y - 22, 460, bh as u32), fill: None, border: 2 });
-                    for (i, ln) in lines.iter().enumerate() {
-                        v.push(txt(ln.clone(), tx, y + 8 + i as i32 * 34, F::Body, Align::Center, INK));
-                    }
-                }
-                let by = if l { h - 70 } else { h - 90 };
-                v.push(rule(tx - 230, tx + 230, by - 44, RULE));
-                v.push(txt("Press the power button to turn on", tx, by, F::Body, Align::Center, INK));
+                let when = last_used.map(|t| fmt_datetime(t, self.status.tz_secs));
+                let owner = self.settings.owner_info.as_deref();
+                lock_split(sz, *battery, when.as_deref(), owner, &mut v);
             }
             Screen::Pin(p) => {
                 v.extend(pin_items(sz, "Enter PIN", "", p.entry.len(), MIN_PIN, p.attempts_left, &p.digits));
@@ -846,4 +830,58 @@ fn shift(it: Item, dy: i32) -> Item {
         Item::Frame { rect, fill, border } => Item::Frame { rect: mv(rect), fill, border },
         other => other,
     }
+}
+
+// ---- lock screen -------------------------------------------------------------------------------
+
+/// Battery gauge + percentage, then clock icon + date/time, centred on cx as one row.
+fn lock_status_row(cx: i32, cy: i32, pct: u8, when: Option<&str>, fg: Gray4, bg: Gray4, v: &mut Vec<Item>) {
+    let pct_s = format!("{pct}%");
+    let pw = crate::gfx::text_width(F::Body, &pct_s);
+    let mut total = 46 + 10 + pw;
+    let ww = when.map(|w| crate::gfx::text_width(F::Body, w)).unwrap_or(0);
+    if when.is_some() {
+        total += 36 + 30 + 10 + ww;
+    }
+    let mut x = cx - total / 2;
+    v.push(Item::Battery { x, cy, pct, fg, bg });
+    x += 46 + 10;
+    v.push(Item::Text { s: pct_s, x, cy, font: F::Body, align: Align::Left, color: fg });
+    x += pw + 36;
+    if let Some(w) = when {
+        v.push(Item::IconC { kind: Icon::Clock, rect: rect(x, cy - 15, 30, 30), fg, bg });
+        x += 30 + 10;
+        v.push(Item::Text { s: w.to_string(), x, cy, font: F::Body, align: Align::Left, color: fg });
+    }
+}
+
+/// Power symbol + arrow in the bottom-right corner, pointing at the power button.
+fn lock_power_hint(sz: Size, fg: Gray4, bg: Gray4, v: &mut Vec<Item>) {
+    let (w, h) = (sz.width as i32, sz.height as i32);
+    v.push(Item::IconC { kind: Icon::Power, rect: rect(w - 118, h - 76, 44, 44), fg, bg });
+    v.push(Item::IconC { kind: Icon::Arrow, rect: rect(w - 64, h - 72, 44, 36), fg, bg });
+}
+
+fn lock_owner(cx: i32, cy: i32, owner: Option<&str>, color: Gray4, v: &mut Vec<Item>) {
+    if let Some(o) = owner {
+        for (i, ln) in wrap(F::Small, o, 440, 2).iter().enumerate() {
+            v.push(Item::Text { s: ln.clone(), x: cx, cy: cy + i as i32 * 26, font: F::Small, align: Align::Center, color });
+        }
+    }
+}
+
+/// Lock screen: top half black (lock + title), bottom half white (brand, status, power hint).
+fn lock_split(sz: Size, pct: u8, when: Option<&str>, owner: Option<&str>, v: &mut Vec<Item>) {
+    let (w, h) = (sz.width as i32, sz.height as i32);
+    let cx = w / 2;
+    let split = h * 54 / 100;
+    v.push(Item::Fill { rect: rect(0, 0, w as u32, split as u32), color: INK });
+    let ic = 130.min(h / 6);
+    v.push(Item::IconC { kind: Icon::Lock, rect: rect(cx - ic / 2, split / 2 - ic + 10, ic as u32, ic as u32), fg: PAPER, bg: INK });
+    v.push(Item::Text { s: "LOCKED".into(), x: cx, cy: split / 2 + 70, font: F::Big, align: Align::Center, color: PAPER });
+    v.push(Item::Text { s: "Tessera Prism".into(), x: cx, cy: split - 50, font: F::Title, align: Align::Center, color: PAPER });
+    v.push(Item::Brand { cx, cy: split + 70, large: true, inverted: false });
+    lock_status_row(cx, split + 170, pct, when, INK, PAPER, v);
+    lock_owner(cx, split + 230, owner, DIM, v);
+    lock_power_hint(sz, INK, PAPER, v);
 }

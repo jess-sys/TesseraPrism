@@ -71,6 +71,7 @@ targets:
       base:
         PRODUCT_NAME: Prism
         PRODUCT_BUNDLE_IDENTIFIER: ch.neutheria.prism
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         TARGETED_DEVICE_FAMILY: "1,2"
         GENERATE_INFOPLIST_FILE: NO
 
@@ -114,6 +115,7 @@ targets:
       base:
         PRODUCT_NAME: Prism
         PRODUCT_BUNDLE_IDENTIFIER: ch.neutheria.prism
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_HARDENED_RUNTIME: YES
         GENERATE_INFOPLIST_FILE: NO
 

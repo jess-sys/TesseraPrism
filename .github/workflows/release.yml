@@ -1,0 +1,151 @@
+name: Release
+
+# Version tags (v1.2.3) publish a GitHub Release; every push to main refreshes the
+# rolling "nightly" pre-release with the latest builds.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  firmware:
+    name: Firmware (ESP32-S3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: true
+      - uses: cargo-bins/cargo-binstall@main
+      - name: espflash
+        run: cargo binstall -y espflash
+      - name: Cache ESP-IDF and build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            firmware/.embuild
+            firmware/target
+            ~/.cargo/registry
+          key: firmware-${{ hashFiles('firmware/Cargo.lock', 'firmware/sdkconfig.defaults', 'firmware/partitions.csv') }}
+          restore-keys: firmware-
+      - name: Build
+        working-directory: firmware
+        run: cargo build --release
+      - name: Flash images
+        working-directory: firmware
+        run: |
+          VER="${GITHUB_REF_NAME//\//-}"
+          ELF=target/xtensa-esp32s3-espidf/release/prism-firmware
+          BL=$(find target/xtensa-esp32s3-espidf/release/build -path '*out/build/bootloader/bootloader.bin' | head -1)
+          mkdir -p ../dist
+          espflash save-image --chip esp32s3 --flash-size 16mb --partition-table partitions.csv \
+            --bootloader "$BL" --merge "$ELF" "../dist/prism-firmware-$VER.bin"
+          cp "$ELF" "../dist/prism-firmware-$VER.elf"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: dist/*
+
+  cli:
+    name: CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: System dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p prism-cli --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          VER="${GITHUB_REF_NAME//\//-}"
+          mkdir -p dist
+          tar -C target/${{ matrix.target }}/release -czf "dist/prism-cli-$VER-${{ matrix.target }}.tar.gz" prism
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+
+  web:
+    name: Web companion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build wasm core
+        run: wasm-pack build crates/prism-wasm --target web --out-dir ../../apps/web/src/wasm/pkg
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: apps/web
+      - name: Package
+        run: |
+          VER="${GITHUB_REF_NAME//\//-}"
+          mkdir -p dist
+          (cd apps/web/dist && zip -qr "../../../dist/prism-web-$VER.zip" .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web
+          path: dist/*
+
+  publish:
+    name: Publish release
+    needs: [firmware, cli, web]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Versioned release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "Tessera Prism $GITHUB_REF_NAME" --generate-notes --verify-tag
+      - name: Nightly pre-release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --yes --cleanup-tag || true
+          git tag -f nightly "$GITHUB_SHA"
+          git push -f origin refs/tags/nightly
+          gh release create nightly dist/* --prerelease --title "Nightly ($(git rev-parse --short HEAD))" \
+            --notes "Automated build of \`main\` at $GITHUB_SHA. Not a stable release: firmware is unaudited and development builds have no flash encryption or secure boot. Flash with: \`espflash write-bin 0x0 prism-firmware-main.bin\` (hold BOOT while powering on first)."
