@@ -42,6 +42,8 @@ pub enum Sound {
     LastChances,
     /// Input not accepted yet (e.g. OK with too few PIN digits): gentle, not an error.
     Invalid,
+    /// Code submitted, device working (PIN check / key derivation running).
+    Processing,
     /// Pairing completed, setup finished.
     Success,
     /// Device locked / powering off.
@@ -112,6 +114,8 @@ fn pattern(s: Sound) -> &'static [Note] {
         Sound::LastChances => const { &[warble(BUZZ, LO, 60, 600)] },
         // Not accepted yet: one short low blip.
         Sound::Invalid => const { &[tone(LO, 45)] },
+        // Code received, processing: fast data burst.
+        Sound::Processing => const { &[tone(HI, 15), gap(15), tone(HI, 15), gap(15), tone(HI, 15), gap(15), tone(HI, 15)] },
         // Link established / setup complete: stepped up, then confirmation pips.
         Sound::Success => const { &[tone(MID, 60), gap(15), tone(PIP, 60), gap(60), tone(HI, 40), gap(40), tone(HI, 40)] },
         // Shutting down: stepped down to a low tone.

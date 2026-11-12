@@ -127,6 +127,10 @@ impl UiTask {
                     let _ = self.power.send(PowerMsg::Activity);
                 }
                 UiAction::InvalidInput => crate::sound::play(crate::sound::Sound::Invalid),
+                UiAction::SubmitPin(pin) => {
+                    crate::sound::play(crate::sound::Sound::Processing);
+                    let _ = self.core.send(CoreMsg::Ui(UiAction::SubmitPin(pin)));
+                }
                 a => {
                     let _ = self.core.send(CoreMsg::Ui(a));
                 }
@@ -144,7 +148,7 @@ impl UiTask {
     fn on_touch(&mut self, down: bool, x: u16, y: u16) {
         let (lx, ly) = self.logical(x, y);
         if down {
-            if self.ui.screen_name() != "lock" {
+            if self.ui.screen_name() != "lock" && !self.ui.input_blocked() {
                 crate::sound::play(crate::sound::Sound::Click);
             }
             log::debug!("touch down: raw=({x}, {y}) logical=({lx}, {ly}) screen={}", self.ui.screen_name());

@@ -357,6 +357,12 @@ impl Ui {
                 let owner = self.settings.owner_info.as_deref();
                 lock_split(sz, *battery, when.as_deref(), owner, &mut v);
             }
+            Screen::Pin(p) if p.verifying => {
+                let (cx, cy) = (w / 2, if l { h / 2 - 40 } else { h / 2 - 80 });
+                v.push(Item::Icon { kind: Icon::Lock, rect: rect(cx - 48, cy - 150, 96, 96) });
+                v.push(txt("Decrypting...", cx, cy + 10, F::Big, Align::Center, INK));
+                v.push(txt("This takes a few seconds.", cx, cy + 70, F::Body, Align::Center, DIM));
+            }
             Screen::Pin(p) => {
                 v.extend(pin_items(sz, "Enter PIN", "", p.entry.len(), MIN_PIN, p.attempts_left, &p.digits));
             }

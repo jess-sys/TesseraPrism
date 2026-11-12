@@ -161,8 +161,14 @@ fn pin_flow() {
     let acts = tap(&mut ui, "Ok");
     let pin = acts.iter().find_map(|a| if let UiAction::SubmitPin(p) = a { Some(p.clone()) } else { None }).expect("SubmitPin");
     assert_eq!(&**pin, "2468");
+    // While the device checks the PIN: keypad hidden, taps ignored, no second submission.
+    assert!(ui.input_blocked());
+    assert!(!ui.targets().iter().any(|(n, _)| n.starts_with("Digit") || n == "Ok"), "keypad must be hidden");
+    render(&ui, "03b_pin_decrypting");
+    assert!(tap_at(&mut ui, Point::new(270, 700)).iter().all(|a| !matches!(a, UiAction::SubmitPin(_))));
     // reject -> warning
     ui.handle(UiEvent::PinRejected { attempts_left: 2 });
+    assert!(!ui.input_blocked());
     render(&ui, "04_pin_attempts_left");
     // backspace
     type_pin(&mut ui, "99");

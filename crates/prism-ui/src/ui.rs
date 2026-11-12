@@ -26,6 +26,9 @@ pub struct PinState {
     pub entry: Zeroizing<String>,
     pub attempts_left: Option<u8>,
     pub digits: [u8; 10],
+    /// PIN submitted, waiting for the device to check it: keypad hidden, taps ignored (no
+    /// queued submissions while the key derivation runs).
+    pub verifying: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +191,11 @@ impl Ui {
     }
 
     /// Screen name, handy for logs and tests.
+    /// True while touches must be ignored (PIN being checked).
+    pub fn input_blocked(&self) -> bool {
+        matches!(&self.screen, Screen::Pin(p) if p.verifying)
+    }
+
     pub fn screen_name(&self) -> &'static str {
         match &self.screen {
             Screen::Splash => "splash",
@@ -400,7 +408,7 @@ impl Ui {
                 self.clear_all();
                 if initialized {
                     let digits = self.shuffled_digits();
-                    self.goto(Screen::Pin(PinState { entry: Zeroizing::new(String::new()), attempts_left: None, digits }));
+                    self.goto(Screen::Pin(PinState { entry: Zeroizing::new(String::new()), attempts_left: None, digits, verifying: false }));
                 } else {
                     self.start_setup();
                 }
@@ -409,11 +417,11 @@ impl Ui {
                 self.clear_all();
                 self.status.locked = true;
                 let digits = self.shuffled_digits();
-                self.goto(Screen::Pin(PinState { entry: Zeroizing::new(String::new()), attempts_left, digits }));
+                self.goto(Screen::Pin(PinState { entry: Zeroizing::new(String::new()), attempts_left, digits, verifying: false }));
             }
             UiEvent::PinRejected { attempts_left } => {
                 let digits = self.shuffled_digits();
-                self.goto(Screen::Pin(PinState { entry: Zeroizing::new(String::new()), attempts_left: Some(attempts_left), digits }));
+                self.goto(Screen::Pin(PinState { entry: Zeroizing::new(String::new()), attempts_left: Some(attempts_left), digits, verifying: false }));
             }
             UiEvent::Locked { battery_pct, last_used } => {
                 self.clear_all();
@@ -524,6 +532,13 @@ impl Ui {
                 }
             }
             UiEvent::Message { text, error } => {
+                // An error ends a pending PIN check (e.g. KDF glitch): back to the keypad after
+                // the message is dismissed.
+                if error {
+                    if let Screen::Pin(p) = &mut self.screen {
+                        p.verifying = false;
+                    }
+                }
                 self.push(Screen::Message { text, error });
             }
         }
@@ -637,6 +652,9 @@ impl Ui {
         // Screen-specific first.
         match &mut self.screen {
             Screen::Pin(p) => {
+                if p.verifying {
+                    return;
+                }
                 let (min, _) = (MIN_PIN, 0);
                 match id {
                     Id::Digit(d) => {
@@ -652,8 +670,11 @@ impl Ui {
                     Id::Ok if p.entry.len() >= min => {
                         let pin = Zeroizing::new(p.entry.to_string());
                         p.entry.clear();
+                        p.verifying = true;
                         out.push(UiAction::SubmitPin(pin));
-                        self.pin_dirty();
+                        // Keypad -> "Decrypting...": whole screen, partial (no full-refresh flash).
+                        let sz = self.size();
+                        self.partial(Rectangle::new(Point::zero(), sz));
                     }
                     Id::Ok => out.push(UiAction::InvalidInput),
                     _ => {}
