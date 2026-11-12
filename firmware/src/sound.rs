@@ -5,7 +5,7 @@
 //! (no musical intervals, no fades), built from a few elements:
 //! - PIP: short 3 kHz tone, the basic acknowledgement unit;
 //! - stepped "stair" tones: up = system online / accepted, down = shutting down / expired;
-//! - fast sweeps (radar-like) for power-up;
+//! - a self-test style pip pair at power-on;
 //! - two-tone warble (klaxon) for alarms;
 //! - long low tones for refusals and errors.
 //!
@@ -75,9 +75,6 @@ const fn tone(f: u32, ms: u32) -> Note {
 const fn quiet(f: u32, ms: u32, vol: u32) -> Note {
     Note { from: f, to: f, alt: 0, period: 0, ms, vol }
 }
-const fn sweep(from: u32, to: u32, ms: u32) -> Note {
-    Note { from, to, alt: 0, period: 0, ms, vol: 100 }
-}
 const fn warble(a: u32, b: u32, period: u32, ms: u32) -> Note {
     Note { from: a, to: a, alt: b, period, ms, vol: 100 }
 }
@@ -120,8 +117,8 @@ fn pattern(s: Sound) -> &'static [Note] {
         Sound::Success => const { &[tone(MID, 60), gap(15), tone(PIP, 60), gap(60), tone(HI, 40), gap(40), tone(HI, 40)] },
         // Shutting down: stepped down to a low tone.
         Sound::Lock => const { &[tone(HI, 50), gap(15), tone(PIP, 50), gap(15), tone(MID, 50), gap(15), tone(LO, 140)] },
-        // Power-up: radar sweep, then a ready pip.
-        Sound::PowerOn => const { &[sweep(600, HI, 180), gap(60), tone(PIP, 60)] },
+        // Power-on self-test passed: one firm pip, then a short "ready" pip.
+        Sound::PowerOn => const { &[tone(PIP, 110), gap(80), tone(HI, 45)] },
         // Vault destroyed: klaxon.
         Sound::Wiped => const { &[warble(LO, PIP, 90, 1400)] },
         // Identify: rapid triple chirp.
