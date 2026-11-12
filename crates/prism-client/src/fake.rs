@@ -153,6 +153,12 @@ async fn run(st: Arc<Mutex<State>>, mut t: MemoryTransport) {
                     }
                 }
             }
+            Ok(DeviceEvent::Unknown { id }) => {
+                let Ok(out) = sess.encrypt_response(&Envelope { id, body: Response::Error(ErrorCode::Unsupported) }) else { return };
+                if t.send_frame(&out).await.is_err() {
+                    return;
+                }
+            }
             Ok(DeviceEvent::Request(env)) => {
                 let body = match auth {
                     0 => Response::Error(ErrorCode::NotPaired),
@@ -241,6 +247,19 @@ fn handle(s: &mut State, _host: [u8; 32], req: Request) -> Response {
             s.paired.retain(|h| &h.public_key != public_key);
             return if s.paired.len() < n { R::Ok } else { err(ErrorCode::NotFound) };
         }
+        Request::RenamePairedHost { public_key, label } => {
+            let label = label.trim();
+            if label.is_empty() {
+                return err(ErrorCode::InvalidRequest);
+            }
+            return match s.paired.iter_mut().find(|h| &h.public_key == public_key) {
+                Some(h) => {
+                    h.label = label.chars().take(32).collect();
+                    R::Ok
+                }
+                None => err(ErrorCode::NotFound),
+            };
+        }
         _ => {}
     }
     if s.locked {
@@ -249,6 +268,7 @@ fn handle(s: &mut State, _host: [u8; 32], req: Request) -> Response {
     let t = now(s);
     match req {
         Request::ListEntries { kind } => R::Entries(s.vault.list_summaries(kind)),
+        Request::ListPasskeys => R::Passkeys(s.vault.passkey_identities()),
         Request::GetSecret { id, field, .. } => {
             let Some(e) = s.vault.get_entry(&id).cloned() else { return err(ErrorCode::NotFound) };
             if let Err(r) = approve(s) {
@@ -354,6 +374,30 @@ fn handle(s: &mut State, _host: [u8; 32], req: Request) -> Response {
                 Err(_) => err(ErrorCode::Internal),
             }
         }
+        Request::SetEntryPolicy { id, policy } => {
+            if let Err(r) = approve(s) {
+                return r;
+            }
+            let Some(mut e) = s.vault.get_entry(&id).cloned() else { return err(ErrorCode::NotFound) };
+            e.policy = policy;
+            match s.vault.update_entry(e) {
+                Ok(()) => R::Ok,
+                Err(_) => err(ErrorCode::NotFound),
+            }
+        }
+        Request::PasswordSnapshot => {
+            if s.settings.password_cache_secs == 0 {
+                return err(ErrorCode::Unsupported);
+            }
+            if let Err(r) = approve(s) {
+                return r;
+            }
+            let snap = s.vault.password_snapshot(t, s.settings.password_cache_secs);
+            let b = postcard::to_stdvec(&snap).unwrap();
+            let n = b.len() as u32;
+            s.export_buf = Some(b);
+            R::ExportReady { total_len: n }
+        }
         Request::ExportChunk { offset } => {
             let Some(b) = &s.export_buf else { return err(ErrorCode::InvalidRequest) };
             let o = offset as usize;
@@ -425,6 +469,7 @@ fn handle(s: &mut State, _host: [u8; 32], req: Request) -> Response {
         | Request::Unlock { .. }
         | Request::Lock
         | Request::ListPairedHosts
-        | Request::RemovePairedHost { .. } => unreachable!(),
+        | Request::RemovePairedHost { .. }
+        | Request::RenamePairedHost { .. } => unreachable!(),
     }
 }

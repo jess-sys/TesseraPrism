@@ -19,13 +19,14 @@ import AppKit
 final class CredentialProviderViewController: ASCredentialProviderViewController {
     private let ui = ProviderModel()
     private var work: Task<Void, Never>?
+    private let cache = PasswordCacheStore()
 
     // MARK: view setup
 
     #if os(iOS)
     override func viewDidLoad() {
         super.viewDidLoad()
-        let host = UIHostingController(rootView: ProviderView(model: ui))
+        let host = UIHostingController(rootView: ProviderView(model: ui).prismBranded())
         addChild(host)
         host.view.frame = view.bounds
         host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -33,15 +34,64 @@ final class CredentialProviderViewController: ASCredentialProviderViewController
         host.didMove(toParent: self)
         wireCancel()
     }
+
+    /// The sheet went away (completed, cancelled, or dismissed by the system): drop any work and
+    /// its BLE session so it can't block other Prism processes.
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        work?.cancel(); watchdog?.cancel()
+    }
     #else
     override func loadView() {
-        let host = NSHostingView(rootView: ProviderView(model: ui))
+        let host = NSHostingView(rootView: ProviderView(model: ui).prismBranded())
         host.frame = NSRect(x: 0, y: 0, width: 360, height: 320)
         view = host
         preferredContentSize = NSSize(width: 360, height: 320)
         wireCancel()
     }
+
+    /// Escape anywhere in the sheet cancels the request (AppKit sends cancelOperation: up the
+    /// responder chain), so a stuck request never blocks the browser.
+    override func cancelOperation(_ sender: Any?) {
+        cancel(.userCanceled)
+    }
+
+    /// Escape cancels. The SwiftUI view inside the browser's sheet never becomes first
+    /// responder, so watch key-downs for the whole extension process instead.
+    private var escapeMonitor: Any?
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        view.window?.makeFirstResponder(view)
+        if escapeMonitor == nil {
+            escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard event.keyCode == 53 else { return event } // kVK_Escape
+                self?.cancel(.userCanceled)
+                return nil
+            }
+        }
+    }
+
+    /// The sheet went away (completed, cancelled, or dismissed by the system): drop any work and
+    /// its BLE session so it can't block other Prism processes.
+    override func viewDidDisappear() {
+        super.viewDidDisappear()
+        work?.cancel(); watchdog?.cancel()
+        if let m = escapeMonitor { NSEvent.removeMonitor(m); escapeMonitor = nil }
+    }
     #endif
+
+    /// Never leave a request (and its BLE session) hanging: give up after 2 minutes.
+    private var watchdog: Task<Void, Never>?
+    private func armWatchdog() {
+        watchdog?.cancel()
+        watchdog = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 120_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            extLog.notice("request watchdog fired")
+            self.cancel(.userCanceled)
+        }
+    }
 
     private func wireCancel() {
         ui.onCancel = { [weak self] in self?.cancel(.userCanceled) }
@@ -49,27 +99,36 @@ final class CredentialProviderViewController: ASCredentialProviderViewController
 
     private func cancel(_ code: ASExtensionError.Code) {
         work?.cancel()
+        watchdog?.cancel()
         extensionContext.cancelRequest(withError: NSError(domain: ASExtensionErrorDomain, code: code.rawValue))
     }
 
     private func fail(_ error: Error) {
         ui.busy = false
         ui.error = error.localizedDescription
+        ui.activity = .failure(error.localizedDescription)
         // Leave the message visible; user dismisses with Cancel.
     }
 
     private func start(_ body: @escaping @MainActor (PrismClient) async throws -> Void) {
-        ui.busy = true; ui.error = nil; ui.status = "Connecting to Prism..."
+        ui.busy = true; ui.error = nil; ui.status = "Connecting to Prism..."; ui.activity = .searching
+        work?.cancel()
+        armWatchdog()
         work = Task { @MainActor in
             let (client, _, store) = PrismConnection.makeClient(scanTimeout: 10)
             do {
                 _ = try await client.connect(needsPairing: !store.isPaired, syncTime: false) { [weak self] sas in
-                    Task { @MainActor in self?.ui.sas = sas }
+                    Task { @MainActor in self?.ui.sas = sas; self?.ui.activity = .pairing(code: sas) }
                 }
                 store.isPaired = true
                 ui.sas = nil
-                ui.status = "Approve on your Prism..."
-                try await body(client)
+                ui.status = "Approve on your Prism..."; ui.activity = .approve
+                // In standby the device wakes to its PIN pad: wait for the user to unlock it.
+                try await untilUnlocked(onLocked: { [weak self] in
+                    self?.ui.status = "Unlock your Tessera Prism to continue..."; self?.ui.activity = .unlock
+                }) {
+                    try await body(client)
+                }
             } catch is CancellationError {
                 extLog.notice("request cancelled")
             } catch {
@@ -84,6 +143,19 @@ final class CredentialProviderViewController: ASCredentialProviderViewController
 
     override func prepareCredentialList(for serviceIdentifiers: [ASCredentialServiceIdentifier]) {
         let hosts = Self.hosts(from: serviceIdentifiers)
+        // A valid local cache lists without contacting the Prism; the password needs biometrics.
+        if let meta = cache.metadata(), !meta.entries.isEmpty {
+            let all = meta.entries.map { EntrySummary(id: $0.id, kind: .password, title: $0.title, subtitle: $0.username, url: $0.url) }
+            let matches = all.filter { Self.matches($0, hosts: hosts) }
+            ui.busy = false
+            ui.choices = matches.isEmpty ? all : matches
+            ui.onPick = { [weak self] summary in
+                guard let self else { return }
+                self.ui.choices = []; self.ui.busy = true
+                self.fillFromCache(id: summary.id, title: summary.title, user: summary.subtitle, host: hosts.first)
+            }
+            return
+        }
         start { [weak self] client in
             guard let self else { return }
             let all = try await client.listEntries(kind: .password)
@@ -92,20 +164,14 @@ final class CredentialProviderViewController: ASCredentialProviderViewController
             self.ui.busy = false
             self.ui.choices = list
             if list.isEmpty { self.ui.status = "No passwords on this Prism." }
+            // Don't hold the session while the user picks: a parked session blocks every other
+            // Prism process on the shared link if the sheet goes away without telling us.
+            // start() disconnects when this returns; the pick reconnects.
             self.ui.onPick = { [weak self] summary in
                 guard let self else { return }
-                self.ui.choices = []; self.ui.busy = true; self.ui.status = "Approve on your Prism..."
-                self.work = Task { @MainActor in
-                    do {
-                        let secret = try await client.getSecret(id: summary.id, field: .password, context: hosts.first)
-                        guard let pw = secret.text else { throw PrismError.protocolViolation("empty secret") }
-                        await client.disconnect()
-                        _ = await self.extensionContext.completeRequest(withSelectedCredential: ASPasswordCredential(user: summary.subtitle, password: pw))
-                    } catch { self.fail(error) }
-                }
+                self.ui.choices = []
+                self.deviceFill(id: summary.id, host: hosts.first ?? summary.title, user: summary.subtitle)
             }
-            // Keep the connection open for the pick; start() would disconnect on return, so park here.
-            try await Self.waitUntilCancelled()
         }
     }
 
@@ -151,6 +217,30 @@ final class CredentialProviderViewController: ASCredentialProviderViewController
 
     private func providePassword(recordIdentifier: String?, host: String, user: String) {
         guard let rid = recordIdentifier, let id = EntryId(hex: rid) else { return cancel(.credentialIdentityNotFound) }
+        if let meta = cache.metadata(), let e = meta.entries.first(where: { $0.id == id }) {
+            ui.busy = true
+            fillFromCache(id: id, title: e.title, user: user, host: host)
+            return
+        }
+        deviceFill(id: id, host: host, user: user)
+    }
+
+    /// Decrypts the cached password after biometric unlock of the key; any failure falls back to the device.
+    private func fillFromCache(id: EntryId, title: String, user: String, host: String?) {
+        let cache = self.cache
+        let site = host ?? title
+        work = Task { @MainActor in
+            let result = await Task.detached { Result { try cache.password(id: id, reason: "Fill password for \(site)") } }.value
+            if case .success(let pw?) = result {
+                _ = await self.extensionContext.completeRequest(withSelectedCredential: ASPasswordCredential(user: user, password: pw))
+                return
+            }
+            extLog.notice("cache miss/failed, using the device: \(String(describing: result), privacy: .public)")
+            self.deviceFill(id: id, host: host ?? title, user: user)
+        }
+    }
+
+    private func deviceFill(id: EntryId, host: String, user: String) {
         start { [weak self] client in
             let secret = try await client.getSecret(id: id, field: .password, context: host)
             guard let pw = secret.text else { throw PrismError.protocolViolation("empty secret") }
@@ -203,6 +293,15 @@ final class CredentialProviderViewController: ASCredentialProviderViewController
             let hex = { (b: [UInt8]) in b.map { String(format: "%02x", $0) }.joined() }
             extLog.notice("register: credId=\(hex(r.credentialId), privacy: .public) authData flags=\(String(format: "%02x", r.authenticatorData.count > 32 ? r.authenticatorData[32] : 0), privacy: .public)")
             extLog.debug("register: attestationObject=\(hex(r.attestationObject), privacy: .public)")
+            // Tell the system the Prism holds this passkey, so browsers that check the identity
+            // store first (Chrome) offer it at sign-in. Done before completing: the extension may
+            // be torn down right after.
+            let store = ASCredentialIdentityStore.shared
+            if await store.state().isEnabled {
+                try? await store.saveCredentialIdentities([ASPasskeyCredentialIdentity(
+                    relyingPartyIdentifier: id.relyingPartyIdentifier, userName: id.userName,
+                    credentialID: Data(r.credentialId), userHandle: id.userHandle, recordIdentifier: nil)])
+            }
             let cred = ASPasskeyRegistrationCredential(
                 relyingParty: id.relyingPartyIdentifier, clientDataHash: req.clientDataHash,
                 credentialID: Data(r.credentialId), attestationObject: Data(r.attestationObject))
@@ -225,16 +324,9 @@ final class CredentialProviderViewController: ASCredentialProviderViewController
             if list.isEmpty { self.ui.status = "No one-time codes on this Prism." }
             self.ui.onPick = { [weak self] summary in
                 guard let self else { return }
-                self.ui.choices = []; self.ui.busy = true; self.ui.status = "Approve on your Prism..."
-                self.work = Task { @MainActor in
-                    do {
-                        let t = try await client.getTotp(id: summary.id)
-                        await client.disconnect()
-                        _ = await self.extensionContext.completeOneTimeCodeRequest(using: ASOneTimeCodeCredential(code: t.code))
-                    } catch { self.fail(error) }
-                }
+                self.ui.choices = []
+                self.provideOneTimeCode(recordIdentifier: summary.id.hex)
             }
-            try await Self.waitUntilCancelled()
         }
     }
 
@@ -266,10 +358,5 @@ final class CredentialProviderViewController: ASCredentialProviderViewController
             let h = h.lowercased()
             return eh == h || eh.hasSuffix("." + h) || h.hasSuffix("." + eh)
         }
-    }
-
-    /// Keeps the BLE connection alive while the user picks from the list.
-    private static func waitUntilCancelled() async throws {
-        try await Task.sleep(nanoseconds: 120 * 1_000_000_000)
     }
 }

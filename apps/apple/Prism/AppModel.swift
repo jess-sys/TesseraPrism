@@ -19,7 +19,39 @@ final class AppModel: ObservableObject {
     @Published var settings: DeviceSettings?
     @Published var pairedHosts: [PairedHost] = []
     @Published var busy: String?          // e.g. "Approve on your Prism"
+    @Published var activity: PrismActivity?   // animated counterpart of `busy`
     @Published var lastError: String?
+    /// Listing of the encrypted local password cache (nil = none / expired). No biometrics needed.
+    @Published var cacheMeta: PasswordCacheMetadata?
+
+    let cache = PasswordCacheStore()
+
+    init() { refreshCacheState() }
+
+    func refreshCacheState() { cacheMeta = cache.metadata() }
+
+    func clearCache() { cache.clear(); cacheMeta = nil }
+
+    /// Fetches a fresh snapshot from the device (tap) and stores it encrypted.
+    func syncCache() async {
+        guard let snap = await run("Approve password cache on your Prism", { try await $0.passwordSnapshot() }) else { return }
+        do { try cache.store(snap) } catch { lastError = "Could not store the cache: \(error.localizedDescription)" }
+        refreshCacheState()
+    }
+
+    /// Password from the local cache (asks for Touch ID / Face ID / passcode). Used while the Prism is not connected.
+    func cachedPassword(id: EntryId, title: String) async -> String? {
+        let cache = self.cache
+        let reason = "Show password for \(title)"
+        let result = await Task.detached { Result { try cache.password(id: id, reason: reason) } }.value
+        refreshCacheState()
+        switch result {
+        case .success(let p): return p
+        case .failure(let e):
+            lastError = e.localizedDescription
+            return nil
+        }
+    }
 
     let core: PrismCore = makeDefaultCore()
     private var client: PrismClient?
@@ -63,6 +95,7 @@ final class AppModel: ObservableObject {
         store.forget()
         try? KeychainHostKeyStore().delete()
         entries = []; sshKeys = []
+        clearCache()
     }
 
     // MARK: operations
@@ -102,27 +135,38 @@ final class AppModel: ObservableObject {
         guard isConnected else { lastError = "Not connected"; return nil }
         idleTask?.cancel()
         busy = label
-        defer { busy = nil; lastUse = Date(); scheduleIdleDisconnect() }
+        activity = label == nil ? nil : .approve
+        defer { busy = nil; activity = nil; lastUse = Date(); scheduleIdleDisconnect() }
         do {
             let fresh = client == nil
             let client = try await ensureClient()
             // Another Prism process may have used the shared link since our last request, which
             // makes the device drop our session: refresh it if we have been idle.
             if !fresh, Date().timeIntervalSince(lastUse) > 5 { try await client.resync() }
-            return try await op(client)
+            // Locked device (standby): it shows its PIN pad; wait for the user to unlock it.
+            return try await untilUnlocked(onLocked: { busy = "Unlock your Tessera Prism to continue..."; activity = .unlock }) {
+                try await op(client)
+            }
         } catch let e as PrismError where Self.isSessionLoss(e) {
             // Session or link lost: reconnect once and retry.
             if let c = client { self.client = nil; await c.disconnect() }
             do {
                 return try await op(try await ensureClient())
             } catch {
+                noteDeviceError(error)
                 lastError = error.localizedDescription
                 return nil
             }
         } catch {
+            noteDeviceError(error)
             lastError = error.localizedDescription
             return nil
         }
+    }
+
+    /// The device no longer knows this host: its password cache must go.
+    private func noteDeviceError(_ error: Error) {
+        if case PrismError.device(.notPaired) = error { clearCache() }
     }
 
     private static func isSessionLoss(_ e: PrismError) -> Bool {
@@ -135,7 +179,20 @@ final class AppModel: ObservableObject {
     func refreshAll() async {
         if let e = await run({ try await $0.listEntries() }) {
             entries = e
-            await updateCredentialStore(e)
+            // Passkeys must be registered too, or Chrome won't offer the Prism for the site. Older
+            // firmware lacks ListPasskeys: then leave the store alone rather than drop passkeys.
+            var passkeys: [PasskeyIdentity]? = []
+            if e.contains(where: { $0.kind == .passkey }) {
+                do {
+                    passkeys = try await client?.listPasskeys()
+                } catch {
+                    passkeys = nil
+                    // Firmware before ListPasskeys drops the session on an unknown request (newer
+                    // firmware answers Unsupported): reconnect on the next call.
+                    if case PrismError.device(.unsupported) = error {} else if let c = client { client = nil; await c.disconnect() }
+                }
+            }
+            if let passkeys { await updateCredentialStore(e, passkeys: passkeys) }
         }
         if let k = await run({ try await $0.sshListKeys() }) { sshKeys = k }
     }
@@ -170,7 +227,20 @@ final class AppModel: ObservableObject {
     }
 
     func save(_ s: DeviceSettings) async {
-        if await run({ try await $0.setSettings(s) }) != nil { settings = s }
+        if await run({ try await $0.setSettings(s) }) != nil {
+            settings = s
+            if s.passwordCacheSecs == 0 { clearCache() }
+        }
+    }
+
+    func setEntryPolicy(_ id: EntryId, _ policy: ApprovalPolicy) async -> Bool {
+        let ok = await run("Confirm on your Prism", { try await $0.setEntryPolicy(id: id, policy: policy) }) != nil
+        if ok { await refreshAll() }
+        return ok
+    }
+
+    func renameHost(_ h: PairedHost, to label: String) async {
+        if await run("Confirm on your Prism", { try await $0.renamePairedHost(publicKey: h.publicKey, label: label) }) != nil { await loadSettings() }
     }
 
     func removeHost(_ h: PairedHost) async {
@@ -200,16 +270,20 @@ final class AppModel: ObservableObject {
 
     // MARK: AutoFill identity store
 
-    private func updateCredentialStore(_ list: [EntrySummary]) async {
-        let identities: [ASPasswordCredentialIdentity] = list.filter { $0.kind == .password }.compactMap { e in
+    private func updateCredentialStore(_ list: [EntrySummary], passkeys: [PasskeyIdentity]) async {
+        var identities: [ASCredentialIdentity] = list.filter { $0.kind == .password }.compactMap { e -> ASPasswordCredentialIdentity? in
             guard let url = e.url, !url.isEmpty else { return nil }
             let host = URL(string: url)?.host ?? url
             return ASPasswordCredentialIdentity(serviceIdentifier: ASCredentialServiceIdentifier(identifier: host, type: .domain),
                                                 user: e.subtitle, recordIdentifier: e.id.hex)
         }
+        identities += passkeys.map {
+            ASPasskeyCredentialIdentity(relyingPartyIdentifier: $0.rpId, userName: $0.userName,
+                                        credentialID: Data($0.credentialId), userHandle: Data($0.userHandle),
+                                        recordIdentifier: $0.id.hex)
+        }
         let s = ASCredentialIdentityStore.shared
-        let state = await s.state()
-        guard state.isEnabled else { return }
+        guard await s.state().isEnabled else { return }
         try? await s.replaceCredentialIdentities(identities)
     }
 }

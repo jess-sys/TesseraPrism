@@ -162,6 +162,12 @@ impl Client {
             r => Err(unexpected(r)),
         }
     }
+    pub async fn list_passkeys(&mut self) -> Result<Vec<PasskeyIdentity>> {
+        match self.call(Request::ListPasskeys).await? {
+            Response::Passkeys(p) => Ok(p),
+            r => Err(unexpected(r)),
+        }
+    }
     pub async fn get_secret(&mut self, id: EntryId, field: SecretField, context: Option<String>) -> Result<SecretValue> {
         match self.call(Request::GetSecret { id, field, context }).await? {
             Response::Secret(s) => Ok(s),
@@ -239,6 +245,29 @@ impl Client {
         out.truncate(total);
         Ok(out)
     }
+    /// Change one entry's approval policy (tap on the device).
+    pub async fn set_entry_policy(&mut self, id: EntryId, policy: ApprovalPolicy) -> Result<()> {
+        self.call_ok(Request::SetEntryPolicy { id, policy }).await
+    }
+    /// All passwords for a local cache (tap on the device). `Device(Unsupported)` when the
+    /// device has caching disabled (`Settings::password_cache_secs == 0`).
+    pub async fn password_snapshot(&mut self) -> Result<PasswordSnapshot> {
+        let total = match self.call(Request::PasswordSnapshot).await? {
+            Response::ExportReady { total_len } => total_len as usize,
+            r => return Err(unexpected(r)),
+        };
+        let mut out = zeroize::Zeroizing::new(Vec::with_capacity(total));
+        while out.len() < total {
+            match self.call(Request::ExportChunk { offset: out.len() as u32 }).await? {
+                Response::Chunk { offset, data } if offset as usize == out.len() && !data.is_empty() => {
+                    out.extend_from_slice(&data)
+                }
+                r => return Err(unexpected(r)),
+            }
+        }
+        out.truncate(total);
+        postcard::from_bytes(&out).map_err(|_| Error::Unexpected("bad password snapshot".into()))
+    }
     /// Upload an export file in 8 KiB chunks and commit.
     pub async fn import(&mut self, data: &[u8], passphrase: &str, mode: ImportMode) -> Result<()> {
         self.call_ok(Request::ImportBegin { total_len: data.len() as u32 }).await?;
@@ -269,6 +298,9 @@ impl Client {
     }
     pub async fn remove_paired_host(&mut self, public_key: [u8; 32]) -> Result<()> {
         self.call_ok(Request::RemovePairedHost { public_key }).await
+    }
+    pub async fn rename_paired_host(&mut self, public_key: [u8; 32], label: &str) -> Result<()> {
+        self.call_ok(Request::RenamePairedHost { public_key, label: label.into() }).await
     }
     pub async fn get_settings(&mut self) -> Result<Settings> {
         match self.call(Request::GetSettings).await? {

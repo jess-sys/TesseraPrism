@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
-use prism_core::model::EntryId;
+use prism_core::model::{ApprovalOp, EntryId};
 use prism_ctap::PresenceResult;
 use prism_proto::Request;
 use prism_ui::ApprovalRequest;
@@ -16,8 +16,15 @@ pub const MAX_QUEUED: usize = 4;
 
 /// What to do once the user answered.
 pub enum Done {
-    Prism { link: Link, req_id: u32, req: Request, session_mark: Option<EntryId> },
-    Ctap { link: Link, reply: SyncSender<PresenceResult> },
+    Prism { link: Link, req_id: u32, req: Request, session_mark: Option<SessionKey> },
+    Ctap { link: Link, reply: SyncSender<PresenceResult>, session_mark: Option<SessionKey> },
+}
+
+/// What a "once per unlock" approval covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SessionKey {
+    Entry(EntryId),
+    Op(ApprovalOp),
 }
 
 impl Done {

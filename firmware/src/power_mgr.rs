@@ -36,7 +36,9 @@ pub const SHUT_PULSES_SENT: u8 = 4;
 pub const SHUT_DEEP_SLEEP: u8 = 5;
 
 const BATTERY_POLL: Duration = Duration::from_secs(30);
-const NO_BLE_POWER_OFF: Duration = Duration::from_secs(10 * 60);
+/// Locked standby (BLE-reachable, light sleep) on battery lasts this long, then the device powers
+/// off completely. ~1.5-3 mA in standby: 24 h costs a few % of the battery.
+const STANDBY_MAX: Duration = Duration::from_secs(24 * 3600);
 
 pub struct PowerMgr {
     power: Power,
@@ -52,7 +54,7 @@ pub struct PowerMgr {
     force_off: bool,
     lock_drawn: bool,
     light_sleeping: bool,
-    no_ble_since: Option<Instant>,
+    standby_since: Option<Instant>,
     last_battery: Instant,
     pm_light: Option<bool>,
 }
@@ -82,7 +84,7 @@ impl PowerMgr {
             force_off: false,
             lock_drawn: false,
             light_sleeping: false,
-            no_ble_since: None,
+            standby_since: None,
             last_battery: Instant::now(),
             pm_light: None,
         };
@@ -104,7 +106,9 @@ impl PowerMgr {
         }
         self.update_pm();
         loop {
-            match self.rx.recv_timeout(Duration::from_millis(50)) {
+            // Locked standby: wake rarely so automatic light sleep can do its job.
+            let tick = if self.light_sleeping { Duration::from_secs(2) } else { Duration::from_millis(50) };
+            match self.rx.recv_timeout(tick) {
                 Ok(m) => self.on_msg(m),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -130,6 +134,9 @@ impl PowerMgr {
                 self.lock_drawn = false;
                 self.last_activity = Instant::now();
                 if m != Mode::LockScreen {
+                    if self.light_sleeping {
+                        self.leave_standby();
+                    }
                     self.light_sleeping = false;
                     self.force_off = false;
                 }
@@ -156,9 +163,23 @@ impl PowerMgr {
         if self.force_off || self.settings.sleep_mode == SleepMode::PowerOff {
             self.shutdown();
         }
-        log::info!("locked: staying reachable over BLE (light sleep)");
+        log::info!("locked: staying reachable over BLE (light sleep standby)");
         self.light_sleeping = true;
-        self.no_ble_since = (!self.status.ble.load(Ordering::Relaxed)).then(Instant::now);
+        self.standby_since = Some(Instant::now());
+        let _ = self.transport.send(TransportCommand::SetLowPower(true));
+        // Touch never wakes the device from standby (only the power button or a paired app's request).
+        unsafe {
+            let _ = sys::gpio_wakeup_disable(board::TOUCH_INT);
+        }
+    }
+
+    fn leave_standby(&mut self) {
+        log::info!("leaving standby");
+        self.standby_since = None;
+        let _ = self.transport.send(TransportCommand::SetLowPower(false));
+        unsafe {
+            let _ = sys::gpio_wakeup_enable(board::TOUCH_INT, sys::gpio_int_type_t_GPIO_INTR_LOW_LEVEL);
+        }
     }
 
     fn policy(&mut self) {
@@ -171,17 +192,13 @@ impl PowerMgr {
             self.last_activity = Instant::now();
             let _ = self.core.send(CoreMsg::AutoLock);
         }
-        // Locked + LightSleep: give up on battery after 10 min without a BLE link.
-        if self.light_sleeping {
-            if self.status.ble.load(Ordering::Relaxed) {
-                self.no_ble_since = None;
-            } else {
-                let since = *self.no_ble_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= NO_BLE_POWER_OFF && !self.power.usb_present() {
-                    log::info!("no BLE connection for 10 min on battery: powering off");
-                    self.shutdown();
-                }
-            }
+        // Locked standby on battery: power off completely after STANDBY_MAX.
+        if self.light_sleeping
+            && self.standby_since.is_some_and(|t| t.elapsed() >= STANDBY_MAX)
+            && !self.status.usb_power.load(Ordering::Relaxed)
+        {
+            log::info!("standby limit reached on battery: powering off");
+            self.shutdown();
         }
     }
 

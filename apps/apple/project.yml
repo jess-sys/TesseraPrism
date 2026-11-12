@@ -51,6 +51,7 @@ targets:
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
         NSBluetoothAlwaysUsageDescription: Prism connects to your Prism hardware device over Bluetooth.
         NSCameraUsageDescription: Prism scans QR codes to add one-time-code entries.
+        NSFaceIDUsageDescription: Prism unlocks the encrypted local password cache with Face ID.
         UTExportedTypeDeclarations:
           - UTTypeIdentifier: ch.neutheria.prism.export
             UTTypeDescription: Prism encrypted export
@@ -72,6 +73,7 @@ targets:
         PRODUCT_NAME: Prism
         PRODUCT_BUNDLE_IDENTIFIER: ch.neutheria.prism
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         TARGETED_DEVICE_FAMILY: "1,2"
         GENERATE_INFOPLIST_FILE: NO
 
@@ -108,6 +110,8 @@ targets:
         com.apple.security.app-sandbox: true
         com.apple.security.device.bluetooth: true
         com.apple.security.files.user-selected.read-write: true
+        # SSH agent status HUD: shared with `prism agent` (crates/prism-cli/src/agent.rs, mod hud).
+        com.apple.security.temporary-exception.files.home-relative-path.read-write: [/.prism/hud/]
         com.apple.security.application-groups: [$(TeamIdentifierPrefix)ch.neutheria.prism]
         com.apple.developer.authentication-services.autofill-credential-provider: true
         keychain-access-groups: [$(AppIdentifierPrefix)ch.neutheria.prism.shared]
@@ -116,6 +120,7 @@ targets:
         PRODUCT_NAME: Prism
         PRODUCT_BUNDLE_IDENTIFIER: ch.neutheria.prism
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         ENABLE_HARDENED_RUNTIME: YES
         GENERATE_INFOPLIST_FILE: NO
 
@@ -126,6 +131,7 @@ targets:
     sources:
       - path: CredentialProvider
         excludes: ["Info.plist", "*.entitlements"]
+      - path: Prism/Assets.xcassets
       - path: Shared
     dependencies:
       - package: PrismKit
@@ -141,6 +147,8 @@ targets:
       base:
         PRODUCT_NAME: CredentialProvider
         PRODUCT_BUNDLE_IDENTIFIER: ch.neutheria.prism.CredentialProvider
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         INFOPLIST_FILE: CredentialProvider/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -153,6 +161,7 @@ targets:
     sources:
       - path: CredentialProvider
         excludes: ["Info.plist", "*.entitlements"]
+      - path: Prism/Assets.xcassets
       - path: Shared
     dependencies:
       - package: PrismKit
@@ -170,6 +179,8 @@ targets:
       base:
         PRODUCT_NAME: CredentialProvider
         PRODUCT_BUNDLE_IDENTIFIER: ch.neutheria.prism.CredentialProvider
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         INFOPLIST_FILE: CredentialProvider/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         ENABLE_HARDENED_RUNTIME: YES

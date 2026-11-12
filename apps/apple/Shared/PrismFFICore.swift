@@ -46,6 +46,7 @@ final class PrismFFICore: PrismCore {
     func randomChannel() -> UInt32 { PrismFFI.randomChannel() }
     func parseOtpauth(_ uri: String) throws -> String { try PrismFFI.parseOtpauth(uri: uri) }
     func totpNow(totpJSON: String, unix: UInt64) throws -> String { try PrismFFI.totpNow(jsonTotp: totpJSON, unix: unix) }
+    func decodePasswordSnapshot(bytes: Data) throws -> String { try PrismFFI.decodePasswordSnapshot(bytes: bytes) }
 }
 #endif
 

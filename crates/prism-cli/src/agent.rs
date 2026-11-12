@@ -93,6 +93,10 @@ struct DevState {
 /// Reconnect from scratch if the connection sat unused for longer than this: after the device
 /// slept, rebooted or was re-flashed, a BLE link can go silent without ever reporting an error.
 const IDLE_RECONNECT: Duration = Duration::from_secs(120);
+/// Drop the device connection after this long without use. On macOS every Prism process shares
+/// one BLE link and only one of them reliably receives the device's notifications, so an idle
+/// agent holding the link breaks the app's AutoFill extension.
+const IDLE_DISCONNECT: Duration = Duration::from_secs(8);
 /// Per-request deadlines. Non-interactive requests answer in well under a second; a signature
 /// may wait for the user's tap (the device auto-denies after 30 s).
 const QUICK_TIMEOUT: Duration = Duration::from_secs(8);
@@ -102,6 +106,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// How long a signature waits for the device to come online / be unlocked.
 const WAIT_FOR_DEVICE: Duration = Duration::from_secs(120);
 const RETRY_EVERY: Duration = Duration::from_secs(2);
+/// A held connection unused for longer than this is checked (GetInfo) before a sign request,
+/// so a device that went away shows "looking for your Prism" instead of a stale "approve".
+const LIVENESS_AFTER: Duration = Duration::from_secs(10);
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Why a device operation could not run.
 enum OpErr {
@@ -127,6 +135,8 @@ pub struct Agent {
     dev: Mutex<DevState>,
     /// Override for tests: directory used instead of `~/.ssh` for known_hosts lookups.
     pub ssh_dir: Option<PathBuf>,
+    /// Show on-screen feedback (HUD / popup / notifications). Off in tests.
+    ui: bool,
 }
 
 fn is_connection_error(e: &ClientError) -> bool {
@@ -139,10 +149,10 @@ fn is_connection_error(e: &ClientError) -> bool {
 
 impl Agent {
     pub fn new(env: Arc<Env>) -> Arc<Agent> {
-        Arc::new(Agent { env, dev: Mutex::new(DevState::default()), ssh_dir: None })
+        Arc::new(Agent { env, dev: Mutex::new(DevState::default()), ssh_dir: None, ui: true })
     }
     pub fn with_ssh_dir(env: Arc<Env>, ssh_dir: PathBuf) -> Arc<Agent> {
-        Arc::new(Agent { env, dev: Mutex::new(DevState::default()), ssh_dir: Some(ssh_dir) })
+        Arc::new(Agent { env, dev: Mutex::new(DevState::default()), ssh_dir: Some(ssh_dir), ui: false })
     }
 
     /// Run `f` against the device connection, (re)connecting lazily and retrying once on
@@ -150,6 +160,16 @@ impl Agent {
     async fn op<T>(
         &self,
         deadline: Duration,
+        f: impl for<'a> Fn(&'a mut Client) -> BoxFuture<'a, Result<T, ClientError>>,
+    ) -> Result<T, OpErr> {
+        self.op_with(deadline, || {}, f).await
+    }
+
+    /// Like `op`, calling `ready` each time a connection is available, just before `f` runs.
+    async fn op_with<T>(
+        &self,
+        deadline: Duration,
+        ready: impl Fn(),
         f: impl for<'a> Fn(&'a mut Client) -> BoxFuture<'a, Result<T, ClientError>>,
     ) -> Result<T, OpErr> {
         let mut st = self.dev.lock().await;
@@ -164,7 +184,19 @@ impl Agent {
                     Err(_) => return Err(OpErr::Unavailable(anyhow::anyhow!("connecting to the device timed out"))),
                 };
                 st.client = Some(c);
+            } else if st.last_ok.is_none_or(|t| t.elapsed() > LIVENESS_AFTER) {
+                let c = st.client.as_mut().unwrap();
+                let alive = matches!(tokio::time::timeout(LIVENESS_TIMEOUT, c.info()).await, Ok(Ok(_)));
+                if !alive {
+                    st.client = None;
+                    if attempt == 1 {
+                        return Err(OpErr::Unavailable(anyhow::anyhow!("the device stopped responding")));
+                    }
+                    continue;
+                }
+                st.last_ok = Some(std::time::Instant::now());
             }
+            ready();
             let res = match tokio::time::timeout(deadline, f(st.client.as_mut().unwrap())).await {
                 Ok(r) => r,
                 Err(_) => Err(ClientError::Timeout),
@@ -229,8 +261,8 @@ impl Agent {
         Ok(cached)
     }
 
-    /// Sign, waiting (up to `WAIT_FOR_DEVICE`) for the device to be reachable and unlocked, with a
-    /// native popup explaining what to do; the popup's Cancel button gives up.
+    /// Sign, waiting (up to `WAIT_FOR_DEVICE`) for the device to be reachable and unlocked, with
+    /// on-screen feedback (see `hud`); its Cancel button gives up.
     async fn sign(&self, blob: &[u8], data: &[u8], flags: u32, hint: Option<String>) -> anyhow::Result<Vec<u8>> {
         // Only keys we know about (cache first; refresh if reachable and unknown).
         let mut known = self.cached_identities().await.iter().any(|k| k.blob == blob);
@@ -238,17 +270,40 @@ impl Agent {
             known = self.identities().await?.iter().any(|k| k.blob == blob);
         }
         anyhow::ensure!(known, "unknown key");
-        let target = hint.clone().map(|h| format!(" to {h}")).unwrap_or_default();
+        let hud = hud::Hud::begin(self.ui, hint.clone());
+        let res = self.sign_loop(&hud, blob, data, flags, hint).await;
+        match &res {
+            Ok(_) => hud.finish(hud::State::Success, ""),
+            Err(e) if format!("{e:#}").contains("cancelled by the user") => hud.finish(hud::State::Idle, ""),
+            Err(e) => hud.finish(hud::State::Failure, &hud::short_reason(&format!("{e:#}"))),
+        }
+        res
+    }
+
+    async fn sign_loop(
+        &self,
+        hud: &hud::Hud,
+        blob: &[u8],
+        data: &[u8],
+        flags: u32,
+        hint: Option<String>,
+    ) -> anyhow::Result<Vec<u8>> {
         let started = std::time::Instant::now();
-        let mut popup: Option<(popup::Popup, bool /*locked*/)> = None;
+        // Show feedback right away, whether or not the device turns out to be reachable; it
+        // switches to "approve" once the request is actually on the device.
+        hud.set(hud::State::Searching, "");
         loop {
             // Ed25519 only: rsa-sha2 flags are ignored.
             let (b, d) = (blob.to_vec(), data.to_vec());
             let res = self
-                .op(SIGN_TIMEOUT, |c| {
-                    let (b, d, h) = (b.clone(), d.clone(), hint.clone());
-                    Box::pin(async move { c.ssh_sign(&b, &d, flags, h).await })
-                })
+                .op_with(
+                    SIGN_TIMEOUT,
+                    || hud.set(hud::State::Approve, ""),
+                    |c| {
+                        let (b, d, h) = (b.clone(), d.clone(), hint.clone());
+                        Box::pin(async move { c.ssh_sign(&b, &d, flags, h).await })
+                    },
+                )
                 .await;
             let locked = match res {
                 Ok(sig) => return Ok(sig),
@@ -259,17 +314,10 @@ impl Agent {
             if started.elapsed() >= WAIT_FOR_DEVICE {
                 anyhow::bail!("gave up waiting for the device");
             }
-            if popup.as_ref().map(|(_, l)| *l) != Some(locked) {
-                let msg = if locked {
-                    format!("Unlock your Tessera Prism to approve the SSH login{target}.")
-                } else {
-                    format!("Turn on your Tessera Prism and unlock it to sign the SSH login{target}.")
-                };
-                popup = Some((popup::Popup::show(&msg, WAIT_FOR_DEVICE), locked));
-            }
+            hud.set(if locked { hud::State::Unlock } else { hud::State::Searching }, "");
             let deadline = std::time::Instant::now() + RETRY_EVERY;
             while std::time::Instant::now() < deadline {
-                if popup.as_mut().is_some_and(|(p, _)| p.dismissed()) {
+                if hud.cancelled() {
                     anyhow::bail!("cancelled by the user");
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -357,8 +405,26 @@ impl Agent {
         }
     }
 
+    /// Release the device connection once it has been idle for `IDLE_DISCONNECT`.
+    async fn release_if_idle(&self) {
+        // try_lock: a busy connection (sign in progress) is by definition not idle.
+        if let Ok(mut st) = self.dev.try_lock() {
+            let idle = st.last_ok.is_none_or(|t| t.elapsed() > IDLE_DISCONNECT);
+            if st.client.is_some() && idle {
+                st.client = None; // Drop disconnects the transport.
+            }
+        }
+    }
+
     /// Accept connections forever.
     pub async fn serve(self: Arc<Self>, listener: UnixListener) -> std::io::Result<()> {
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                me.release_if_idle().await;
+            }
+        });
         loop {
             let (s, _) = listener.accept().await?;
             let me = self.clone();
@@ -415,64 +481,220 @@ mod tests {
     }
 }
 
-/// Native "waiting for the device" popup. macOS: an AppleScript dialog with a Cancel button
-/// (closed automatically when the device answers). Linux: a desktop notification (no Cancel).
-mod popup {
-    use std::process::{Child, Command, Stdio};
-    use std::time::Duration;
+/// On-screen feedback for SSH sign requests.
+///
+/// macOS: the Prism app shows a floating HUD. We write the state to `agent-status.json` in the
+/// shared folder `~/.prism/hud` (the sandboxed app is entitled to it); the app acknowledges
+/// by writing the sequence number to `agent-ack` (informational), and Cancel is `agent-cancel` containing the
+/// sequence number. Without the app there is no on-screen feedback on macOS; on
+/// notification. Linux: `notify-send`, if present. Everything here is best effort and silent.
+mod hud {
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    pub struct Popup {
-        child: Option<Child>,
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum State {
+        Searching,
+        Unlock,
+        Approve,
+        Success,
+        Failure,
+        /// Nothing to show (hide the HUD).
+        Idle,
     }
 
-    fn escape(s: &str) -> String {
-        s.replace('\\', "\\\\").replace('"', "\\\"")
+    impl State {
+        fn name(self) -> &'static str {
+            match self {
+                State::Searching => "searching",
+                State::Unlock => "unlock",
+                State::Approve => "approve",
+                State::Success => "success",
+                State::Failure => "failure",
+                State::Idle => "idle",
+            }
+        }
     }
 
-    impl Popup {
-        pub fn show(message: &str, timeout: Duration) -> Popup {
-            let child = if cfg!(target_os = "macos") {
-                // A background (launchd) process's dialog stays hidden unless it activates first.
-                // Also post a Notification Center banner, which shows even if the dialog doesn't.
-                let msg = escape(message);
-                let notify = format!("display notification \"{msg}\" with title \"Tessera Prism\" sound name \"Ping\"");
-                let dialog = format!(
-                    "display dialog \"{msg}\" with title \"Tessera Prism\" buttons {{\"Cancel\"}} default button 1 with icon caution giving up after {}",
-                    timeout.as_secs()
-                );
-                Command::new("osascript")
-                    .args(["-e", &notify, "-e", "tell me to activate", "-e", &dialog])
+    pub struct Hud {
+        dir: Option<PathBuf>,
+        enabled: bool,
+        seq: u64,
+        host: Option<String>,
+    }
+
+    /// Directory shared with the Prism app: `~/.prism/hud` (the sandboxed macOS app has a
+    /// home-relative entitlement for exactly this folder; a group container would make macOS
+    /// prompt about "data from other apps"). macOS only, and only if the app is installed.
+    fn app_dir() -> Option<PathBuf> {
+        if let Some(d) = std::env::var_os("PRISM_HUD_DIR") {
+            return Some(d.into());
+        }
+        if !cfg!(target_os = "macos") {
+            return None;
+        }
+        let home = dirs::home_dir()?;
+        let installed = [PathBuf::from("/Applications/Prism.app"), home.join("Applications/Prism.app")]
+            .iter()
+            .any(|p| p.is_dir());
+        if !installed {
+            return None;
+        }
+        let d = home.join(".prism/hud");
+        std::fs::create_dir_all(&d).ok()?;
+        Some(d)
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    }
+
+    /// First line of an error, trimmed to something that fits in the HUD.
+    pub fn short_reason(e: &str) -> String {
+        let line = e.lines().next().unwrap_or("").trim();
+        let mut out: String = line.chars().take(80).collect();
+        if line.chars().count() > 80 {
+            out.push('…');
+        }
+        out
+    }
+
+    impl Hud {
+        pub fn begin(enabled: bool, host: Option<String>) -> Hud {
+            let dir = if enabled { app_dir().filter(|d| d.is_dir()) } else { None };
+            Hud::with_dir(enabled, dir, host)
+        }
+
+        fn with_dir(enabled: bool, dir: Option<PathBuf>, host: Option<String>) -> Hud {
+            let hud = Hud { dir, enabled, seq: now_ms(), host };
+            #[cfg(target_os = "macos")]
+            if hud.dir.is_some() && std::env::var_os("PRISM_HUD_DIR").is_none() {
+                // Start the app in the background (no activation) if it isn't running.
+                let _ = Command::new("open")
+                    // Not hidden (-j): a hidden app's HUD panel would stay invisible. The app
+                    // closes its main window itself when started with --background.
+                    .args(["-g", "-b", "ch.neutheria.prism", "--args", "--background"])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
-                    .ok()
-            } else {
-                let _ = Command::new("notify-send")
-                    .args(["-a", "Tessera Prism", "Tessera Prism", message])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
-                None
-            };
-            Popup { child }
+                    .map(|mut c| std::thread::spawn(move || c.wait()));
+            }
+            hud
         }
 
-        /// True once the user closed the dialog (Cancel) or it gave up on its own.
-        pub fn dismissed(&mut self) -> bool {
-            match &mut self.child {
-                Some(c) => matches!(c.try_wait(), Ok(Some(_))),
-                None => false,
+        fn path(&self, name: &str) -> Option<PathBuf> {
+            self.dir.as_ref().map(|d| d.join(name))
+        }
+
+        fn title_and_icon(&self, st: State, message: &str) -> (String, String, &'static str) {
+            let host = self.host.as_deref();
+            match st {
+                State::Searching => ("Looking for your Prism".into(), "Make sure it is on and nearby".into(), "network-wireless"),
+                State::Unlock => ("Unlock your Prism".into(), "Enter your PIN on the device".into(), "dialog-password"),
+                State::Approve => (
+                    "Approve on your Prism".into(),
+                    format!("SSH sign-in to {}", host.unwrap_or("a server")),
+                    "dialog-question",
+                ),
+                State::Success => (format!("Signed in to {}", host.unwrap_or("server")), String::new(), "emblem-ok"),
+                State::Failure => ("SSH sign-in failed".into(), message.to_string(), "dialog-error"),
+                State::Idle => (String::new(), String::new(), ""),
             }
+        }
+
+        /// Publish the current state. Never fails.
+        pub fn set(&self, st: State, message: &str) {
+            if !self.enabled {
+                return;
+            }
+            if let Some(dir) = &self.dir {
+                let (title, subtitle, _) = self.title_and_icon(st, message);
+                write_status(dir, self.seq, st, self.host.as_deref(), &title, &subtitle);
+            } else if cfg!(target_os = "linux") && st != State::Idle {
+                let (title, subtitle, icon) = self.title_and_icon(st, message);
+                notify_send(&title, &subtitle, icon);
+            }
+        }
+
+        /// Final state (success / failure / idle after a cancel).
+        pub fn finish(&self, st: State, message: &str) {
+            self.set(st, message);
+        }
+
+
+        /// Cancel pressed in the HUD for this request.
+        pub fn cancelled(&self) -> bool {
+            let Some(p) = self.path("agent-cancel") else { return false };
+            let hit = read_cancel(&p) == Some(self.seq);
+            if hit {
+                let _ = std::fs::remove_file(&p);
+            }
+            hit
         }
     }
 
-    impl Drop for Popup {
-        fn drop(&mut self) {
-            if let Some(c) = &mut self.child {
-                let _ = c.kill();
-                let _ = c.wait();
-            }
+    pub(super) fn read_cancel(p: &Path) -> Option<u64> {
+        std::fs::read_to_string(p).ok()?.trim().parse().ok()
+    }
+
+    /// Atomically replace `agent-status.json`.
+    pub(super) fn write_status(dir: &Path, seq: u64, st: State, host: Option<&str>, title: &str, subtitle: &str) {
+        let v = serde_json::json!({
+            "seq": seq,
+            "state": st.name(),
+            "host": host,
+            "title": title,
+            "message": subtitle,
+            "ts": now_ms() / 1000,
+        });
+        let tmp = dir.join(".agent-status.tmp");
+        let ok = serde_json::to_vec(&v).ok().and_then(|b| std::fs::write(&tmp, b).ok()).is_some();
+        if ok {
+            let _ = std::fs::rename(&tmp, dir.join("agent-status.json"));
+        }
+    }
+
+    fn notify_send(title: &str, body: &str, icon: &str) {
+        let _ = Command::new("notify-send")
+            .args(["-a", "Tessera Prism", "-i", icon, "-t", "4000", "-h", "string:x-canonical-private-synchronous:prism-ssh", title, body])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|mut c| std::thread::spawn(move || c.wait()));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn status_and_cancel_roundtrip() {
+            let dir = tempfile::tempdir().unwrap();
+            let hud = Hud::with_dir(true, Some(dir.path().to_path_buf()), Some("github.com".into()));
+            hud.set(State::Approve, "");
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join("agent-status.json")).unwrap()).unwrap();
+            assert_eq!(v["state"], "approve");
+            assert_eq!(v["host"], "github.com");
+            assert_eq!(v["seq"].as_u64().unwrap(), hud.seq);
+            assert!(!dir.path().join(".agent-status.tmp").exists());
+
+            assert!(!hud.cancelled());
+            std::fs::write(dir.path().join("agent-cancel"), "1").unwrap();
+            assert!(!hud.cancelled(), "other request's cancel is ignored");
+            std::fs::write(dir.path().join("agent-cancel"), format!("{}\n", hud.seq)).unwrap();
+            assert!(hud.cancelled());
+            assert!(!hud.cancelled(), "cancel is consumed");
+
+        }
+
+        #[test]
+        fn reasons_are_short() {
+            assert_eq!(short_reason("denied\nmore"), "denied");
+            assert!(short_reason(&"x".repeat(200)).chars().count() <= 81);
         }
     }
 }

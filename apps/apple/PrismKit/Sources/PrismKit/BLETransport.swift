@@ -28,7 +28,9 @@ public final class BLETransport: NSObject, PrismTransport, CBCentralManagerDeleg
     private let chan: UInt32
     private var reassembler: PrismReassembler
     private var connectCont: CheckedContinuation<Void, Error>?
-    private var readyCont: CheckedContinuation<Void, Never>?
+    /// Senders waiting for `peripheralIsReady(toSendWriteWithoutResponse:)`, by token.
+    private var readyConts: [UInt64: CheckedContinuation<Bool, Never>] = [:]
+    private var readyToken: UInt64 = 0
     private var stateWaiters: [CheckedContinuation<Void, Error>] = []
     private var timeoutWork: DispatchWorkItem?
 
@@ -71,16 +73,27 @@ public final class BLETransport: NSObject, PrismTransport, CBCentralManagerDeleg
         let maxChunk = p.maximumWriteValueLength(for: .withoutResponse)
         let chunks = core.bleChunk(frame: frame, maxChunk: maxChunk, chan: chan)
         bleLog.debug("tx frame len=\(frame.count, privacy: .public) maxChunk=\(maxChunk, privacy: .public) chunks=\(chunks.count, privacy: .public)")
+        bleLog.notice("tx frame len=\(frame.count, privacy: .public) chunks=\(chunks.count, privacy: .public) chan=\(self.chan, privacy: .public)")
         for chunk in chunks {
-            try await waitWritable(p)
-            p.writeValue(Data(chunk), for: rx, type: .withoutResponse)
+            // Acknowledged writes: the device confirms each chunk (logged in didWriteValueFor),
+            // and no reliance on the write-without-response "ready" callback, which some
+            // processes sharing the macOS link never get.
+            p.writeValue(Data(chunk), for: rx, type: .withResponse)
         }
     }
 
     public func disconnect() {
         queue.async {
             self.central.stopScan()
-            if let p = self.peripheral { self.central.cancelPeripheralConnection(p) }
+            if let p = self.peripheral {
+                // Unsubscribe explicitly before leaving: on macOS the link (and its notification
+                // state) outlives this process's connection when other processes share it.
+                if let tx = p.services?.first(where: { $0.uuid == PrismBLE.service })?
+                    .characteristics?.first(where: { $0.uuid == PrismBLE.tx }), tx.isNotifying {
+                    p.setNotifyValue(false, for: tx)
+                }
+                self.central.cancelPeripheralConnection(p)
+            }
             self.finish()
         }
     }
@@ -101,10 +114,17 @@ public final class BLETransport: NSObject, PrismTransport, CBCentralManagerDeleg
         }
     }
 
-    private func waitWritable(_ p: CBPeripheral) async throws {
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+    /// True once write-without-response is possible, false after `timeout`.
+    private func waitWritable(_ p: CBPeripheral, timeout: TimeInterval) async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             queue.async {
-                if p.canSendWriteWithoutResponse { cont.resume() } else { self.readyCont = cont }
+                if p.canSendWriteWithoutResponse { return cont.resume(returning: true) }
+                self.readyToken &+= 1
+                let token = self.readyToken
+                self.readyConts[token] = cont
+                self.queue.asyncAfter(deadline: .now() + timeout) {
+                    self.readyConts.removeValue(forKey: token)?.resume(returning: false)
+                }
             }
         }
     }
@@ -122,7 +142,8 @@ public final class BLETransport: NSObject, PrismTransport, CBCentralManagerDeleg
     }
 
     private func finish() {
-        if let r = readyCont { readyCont = nil; r.resume() }
+        let waiting = readyConts; readyConts = [:]
+        waiting.values.forEach { $0.resume(returning: false) }
         continuation.finish()
     }
 
@@ -191,7 +212,7 @@ public final class BLETransport: NSObject, PrismTransport, CBCentralManagerDeleg
     public func peripheral(_ p: CBPeripheral, didUpdateValueFor c: CBCharacteristic, error: Error?) {
         if let error { bleLog.error("value update error: \(error.localizedDescription, privacy: .public)") }
         guard error == nil, c.uuid == PrismBLE.tx, let data = c.value else { return }
-        bleLog.debug("rx chunk len=\(data.count, privacy: .public) hdr=\(data.first ?? 0, privacy: .public)")
+        bleLog.notice("rx chunk len=\(data.count, privacy: .public) hdr=\(data.first ?? 0, privacy: .public)")
         do {
             if let frame = try reassembler.push([UInt8](data)) { continuation.yield(frame) }
         } catch {
@@ -201,7 +222,13 @@ public final class BLETransport: NSObject, PrismTransport, CBCentralManagerDeleg
     }
 
     public func peripheralIsReady(toSendWriteWithoutResponse p: CBPeripheral) {
-        if let r = readyCont { readyCont = nil; r.resume() }
+        let waiting = readyConts; readyConts = [:]
+        waiting.values.forEach { $0.resume(returning: true) }
+    }
+
+    public func peripheral(_ p: CBPeripheral, didWriteValueFor c: CBCharacteristic, error: Error?) {
+        if let error { bleLog.error("write error: \(error.localizedDescription, privacy: .public)") }
+        else { bleLog.notice("write acknowledged") }
     }
 }
 #endif

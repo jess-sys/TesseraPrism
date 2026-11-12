@@ -52,7 +52,15 @@ public actor PrismClient {
                         onSAS: (@Sendable (String) -> Void)? = nil) async throws -> DeviceInfo {
         try await transport.connect()
         startReader()
-        let s = try await runHandshake()
+        let s: PrismSession
+        do {
+            s = try await runHandshake(timeout: 6)
+        } catch PrismError.timeout {
+            // A handshake that crosses another process's traffic on the shared macOS link can
+            // go unanswered; a second attempt on the same link normally succeeds.
+            clientLog.notice("handshake: no answer, retrying")
+            s = try await runHandshake(timeout: 12)
+        }
         if needsPairing, let sas = s.sas() { onSAS?(sas) }
 
         // First request. An unpaired host in pairing mode gets `Paired` once the user confirms on the device.
@@ -68,7 +76,7 @@ public actor PrismClient {
     /// session. Needed on macOS, where the app and its AutoFill extension share one BLE link: when
     /// the other process opens a session, the device replaces ours (newest client wins).
     @discardableResult
-    private func runHandshake() async throws -> PrismSession {
+    private func runHandshake(timeout: TimeInterval = 15) async throws -> PrismSession {
         let key = try hostKeys.loadOrCreate(core: core)
         let s = try core.makeSession(hostPrivateKey: key.privateKey)
         session = s
@@ -80,8 +88,8 @@ public actor PrismClient {
                 catch { await self?.failHandshake(error) }
             }
             Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
-                await self?.failHandshake(PrismError.timeout)
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                await self?.failHandshake(PrismError.timeout, ifStill: s)
             }
         }
         return s
@@ -103,6 +111,12 @@ public actor PrismClient {
 
     private func failHandshake(_ e: Error) {
         if let h = handshake { handshake = nil; h.resume(throwing: e) }
+    }
+
+    /// Timeout for one handshake attempt: ignored once a newer attempt has started.
+    private func failHandshake(_ e: Error, ifStill s: PrismSession) {
+        guard session === s else { return }
+        failHandshake(e)
     }
 
     private func teardown(_ error: Error) {
@@ -204,6 +218,9 @@ public actor PrismClient {
     public func listEntries(kind: EntryKind? = nil) async throws -> [EntrySummary] {
         try await expect(.listEntries(kind: kind)) { if case .entries(let e) = $0 { return e }; return nil }
     }
+    public func listPasskeys() async throws -> [PasskeyIdentity] {
+        try await expect(.listPasskeys) { if case .passkeys(let p) = $0 { return p }; return nil }
+    }
     public func getSecret(id: EntryId, field: SecretField, context: String? = nil) async throws -> SecretValue {
         try await expect(.getSecret(id: id, field: field, context: context)) { if case .secret(let s) = $0 { return s }; return nil }
     }
@@ -236,15 +253,21 @@ public actor PrismClient {
         try await expect(.listPairedHosts) { if case .pairedHosts(let h) = $0 { return h }; return nil }
     }
     public func removePairedHost(publicKey: [UInt8]) async throws { try await expectOk(.removePairedHost(publicKey: publicKey)) }
+    public func renamePairedHost(publicKey: [UInt8], label: String) async throws { try await expectOk(.renamePairedHost(publicKey: publicKey, label: label)) }
     public func getSettings() async throws -> DeviceSettings {
         try await expect(.getSettings) { if case .settings(let s) = $0 { return s }; return nil }
     }
     public func setSettings(_ s: DeviceSettings) async throws { try await expectOk(.setSettings(settings: s)) }
+    public func setEntryPolicy(id: EntryId, policy: ApprovalPolicy) async throws { try await expectOk(.setEntryPolicy(id: id, policy: policy)) }
 
     // MARK: export / import
 
     public func exportVault(passphrase: String, progress: (@Sendable (Double) -> Void)? = nil) async throws -> Data {
         let total = try await expect(.export(passphrase: passphrase)) { if case .exportReady(let t) = $0 { return Int(t) }; return nil }
+        return try await readChunks(total: total, progress: progress)
+    }
+
+    private func readChunks(total: Int, progress: (@Sendable (Double) -> Void)? = nil) async throws -> Data {
         var out: [UInt8] = []
         out.reserveCapacity(total)
         while out.count < total {
@@ -256,6 +279,14 @@ public actor PrismClient {
             progress?(Double(out.count) / Double(max(total, 1)))
         }
         return Data(out)
+    }
+
+    /// Password snapshot for the local cache (device asks for a tap).
+    public func passwordSnapshot() async throws -> PasswordSnapshot {
+        let total = try await expect(.passwordSnapshot) { if case .exportReady(let t) = $0 { return Int(t) }; return nil }
+        let bytes = try await readChunks(total: total)
+        let json = try core.decodePasswordSnapshot(bytes: bytes)
+        return try PrismJSON.decode(PasswordSnapshot.self, from: json)
     }
 
     public func importVault(_ file: Data, passphrase: String, mode: ImportMode,

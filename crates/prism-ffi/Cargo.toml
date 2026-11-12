@@ -19,5 +19,7 @@ prism-core.workspace = true
 prism-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+postcard.workspace = true
+zeroize.workspace = true
 thiserror.workspace = true
 uniffi = { version = "0.32", features = ["cli"] }

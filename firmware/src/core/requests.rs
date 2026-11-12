@@ -5,16 +5,17 @@
 //! |------------------------------------------|---------------|---------------------------------------|
 //! | GetInfo, SetTime, GetSettings, Lock      | works         | no                                    |
 //! | Unlock{passphrase}                       | (is the unlock)| no (passphrase is the proof)         |
-//! | ListEntries, SshListKeys, ListPairedHosts, Export/Import chunks | Locked | no |
-//! | SetSettings, RemovePairedHost | Locked | always |
-//! | GetSecret / GetTotp / GetEntry / SshSign / MarkRecoveryCodeUsed | Locked | per entry policy (Always / Session once / Never) |
-//! | AddEntry, UpdateEntry, DeleteEntry, GenerateSshKey, SetRecoveryPassphrase, TypeEntry, Export, ImportCommit | Locked | always |
-//! | Ctap                                     | Locked        | Authenticator asks for presence       |
+//! | ListEntries, ListPasskeys, SshListKeys, ListPairedHosts, Export/Import chunks | Locked | no |
+//! | SetSettings, RemovePairedHost, RenamePairedHost, SetEntryPolicy, PasswordSnapshot | Locked | always |
+//! | GetSecret / GetTotp / GetEntry / SshSign / MarkRecoveryCodeUsed | Locked | entry policy, or the operation default (`Settings::approvals`) when the entry says Default |
+//! | AddEntry, UpdateEntry, GenerateSshKey (Modify), DeleteEntry (Delete), TypeEntry (TypeOverUsb) | Locked | operation default |
+//! | UpdateEntry that changes the entry's policy, SetRecoveryPassphrase, Export, ImportCommit | Locked | always |
+//! | Ctap                                     | Locked        | registration always; sign-in per the passkey default (Always / once per unlock) |
 use std::time::{Duration, Instant};
 
 use prism_core::export::{self, import};
 use prism_core::model::{
-    ApprovalPolicy, Entry, EntryData, EntryId, ImportMode, Passkey, SecretField, SecretValue, SshKeySource,
+    ApprovalOp, ApprovalPolicy, Entry, EntryData, EntryId, ImportMode, Passkey, SecretField, SecretValue, SshKeySource,
 };
 use prism_core::slots::KdfParams;
 use prism_core::{totp, Error as CoreError, UnlockedVault};
@@ -23,7 +24,7 @@ use prism_proto::{ErrorCode, Request, Response};
 use prism_ui::{ApprovalKind, ApprovalRequest, UiEvent};
 use zeroize::Zeroizing;
 
-use super::approval::{Done, Outcome, Pending, APPROVAL_TIMEOUT};
+use super::approval::{Done, Outcome, Pending, SessionKey, APPROVAL_TIMEOUT};
 use super::msg::{CtapJob, CtapReply, Mode, PlatformOp, PowerMsg};
 use super::{link_name, Core, ImportBuf, PendingReplace, MAX_IMPORT_BYTES, PIN_PROMPT_TIMEOUT};
 use crate::storage::MAX_VAULT_BYTES;
@@ -33,7 +34,7 @@ pub(super) struct Spec {
     pub kind: ApprovalKind,
     pub title: String,
     pub context: String,
-    pub session_mark: Option<EntryId>,
+    pub session_mark: Option<SessionKey>,
 }
 
 /// Strip control characters and cap the length of host-supplied text shown on the approval screen.
@@ -77,6 +78,26 @@ pub(super) fn secret_value(e: &Entry, field: SecretField) -> Option<SecretValue>
     }
 }
 
+/// Which approval default covers using `e` (for `field`).
+fn op_for(e: &Entry, field: Option<SecretField>) -> ApprovalOp {
+    match (&e.data, field) {
+        (_, Some(SecretField::TotpSecret)) | (EntryData::Totp(_), _) => ApprovalOp::Totp,
+        (EntryData::RecoveryCodes(_), _) => ApprovalOp::RecoveryCodes,
+        (EntryData::SshKey(_), _) => ApprovalOp::SshSign,
+        (EntryData::Passkey(_), _) => ApprovalOp::Passkey,
+        (EntryData::Password(_), _) => ApprovalOp::Password,
+    }
+}
+
+fn policy_name(p: ApprovalPolicy) -> &'static str {
+    match p {
+        ApprovalPolicy::Always => "always ask",
+        ApprovalPolicy::Session => "once per unlock",
+        ApprovalPolicy::Never => "never ask",
+        ApprovalPolicy::Default => "device default",
+    }
+}
+
 fn approval_kind_for(e: &Entry, field: Option<SecretField>) -> ApprovalKind {
     match (&e.data, field) {
         (_, Some(SecretField::TotpSecret)) => ApprovalKind::Totp,
@@ -92,16 +113,33 @@ impl Core {
     // ---- gating --------------------------------------------------------------------------
 
     fn policy_gate(&self, e: &Entry, field: Option<SecretField>, context: String) -> Option<Spec> {
-        let need = match e.policy {
-            ApprovalPolicy::Always => true,
-            ApprovalPolicy::Session => !self.session_approved.contains(&e.id),
+        let policy = self.settings.approvals.effective(e.policy, op_for(e, field));
+        let key = SessionKey::Entry(e.id);
+        let need = match policy {
+            ApprovalPolicy::Session => !self.session_approved.contains(&key),
             ApprovalPolicy::Never => false,
+            ApprovalPolicy::Always | ApprovalPolicy::Default => true,
         };
         need.then(|| Spec {
             kind: approval_kind_for(e, field),
             title: clean(&e.title, 48),
             context,
-            session_mark: (e.policy == ApprovalPolicy::Session).then_some(e.id),
+            session_mark: (policy == ApprovalPolicy::Session).then_some(key),
+        })
+    }
+
+    /// Gate for an operation that follows only its device-wide default.
+    fn op_gate(&self, op: ApprovalOp, title: &str, context: &str) -> Option<Spec> {
+        let key = SessionKey::Op(op);
+        let policy = self.settings.approvals.get(op);
+        let need = match policy {
+            ApprovalPolicy::Session => !self.session_approved.contains(&key),
+            ApprovalPolicy::Never => false,
+            ApprovalPolicy::Always | ApprovalPolicy::Default => true,
+        };
+        need.then(|| Spec {
+            session_mark: (policy == ApprovalPolicy::Session).then_some(key),
+            ..Self::always(title, context)
         })
     }
 
@@ -126,7 +164,11 @@ impl Core {
                     .map(|h| h.label.clone()).unwrap_or_else(|| "unknown host".into());
                 Some(Self::always(&label, "Remove paired host"))
             }
-            ListEntries { .. } | SshListKeys | ListPairedHosts
+            RenamePairedHost { public_key, label } => {
+                let old = self.hosts.iter().find(|h| &h.public_key == public_key).ok_or(ErrorCode::NotFound)?;
+                Some(Self::always(&old.label, &format!("Rename to \"{}\"", clean(label.trim(), 32))))
+            }
+            ListEntries { .. } | ListPasskeys | SshListKeys | ListPairedHosts
             | ExportChunk { .. } | ImportBegin { .. } | ImportChunk { .. } | Ctap { .. } => None,
             GetSecret { id, field, context } => {
                 let e = lookup(id)?;
@@ -150,19 +192,38 @@ impl Core {
                 let host = host_hint.as_deref().map(|h| clean(h, 60)).unwrap_or_else(|| "unknown host".into());
                 self.policy_gate(e, None, format!("sign for {host}"))
             }
-            AddEntry { entry } => Some(Self::always(&entry.title, "Add entry")),
+            AddEntry { entry } => self.op_gate(ApprovalOp::Modify, &entry.title, "Add entry"),
             UpdateEntry { entry } => {
                 let cur = lookup(&entry.id)?;
-                Some(Self::always(&cur.title, "Update entry"))
+                if entry.policy != cur.policy {
+                    // Changing how an entry is protected always needs the owner.
+                    Some(Self::always(&cur.title, &format!("Update entry, approval: {}", policy_name(entry.policy))))
+                } else {
+                    self.op_gate(ApprovalOp::Modify, &cur.title, "Update entry")
+                }
             }
             DeleteEntry { id } => {
                 let e = lookup(id)?;
-                Some(Self::always(&e.title, "DELETE entry"))
+                self.op_gate(ApprovalOp::Delete, &e.title, "DELETE entry")
             }
-            GenerateSshKey { name, .. } => Some(Self::always(name, "Generate SSH key")),
+            GenerateSshKey { name, .. } => self.op_gate(ApprovalOp::Modify, name, "Generate SSH key"),
             TypeEntry { id, field, .. } => {
                 let e = lookup(id)?;
-                Some(Self::always(&e.title, &format!("Type {} over USB", field_name(*field))))
+                self.op_gate(ApprovalOp::TypeOverUsb, &e.title, &format!("Type {} over USB", field_name(*field)))
+            }
+            SetEntryPolicy { id, policy } => {
+                let e = lookup(id)?;
+                Some(Self::always(&e.title, &format!("Approval: {}", policy_name(*policy))))
+            }
+            PasswordSnapshot => {
+                if self.settings.password_cache_secs == 0 {
+                    return Err(ErrorCode::Unsupported);
+                }
+                if !self.clock.is_valid() {
+                    return Err(ErrorCode::InvalidRequest);
+                }
+                let n = v.vault.entries.iter().filter(|e| matches!(e.data, EntryData::Password(_))).count();
+                Some(Self::always("Password cache", &format!("Copy {n} passwords to this host")))
             }
             SetRecoveryPassphrase { .. } => Some(Self::always("Recovery passphrase", "Set / replace")),
             Export { .. } => Some(Self::always("Export vault", "Encrypted backup file")),
@@ -249,7 +310,8 @@ impl Core {
         }
         match outcome {
             Outcome::Approved => self.sound(crate::sound::Sound::Approved),
-            Outcome::Denied | Outcome::Timeout => self.sound(crate::sound::Sound::Denied),
+            Outcome::Denied => self.sound(crate::sound::Sound::Denied),
+            Outcome::Timeout => self.sound(crate::sound::Sound::Timeout),
             Outcome::Cancelled => {}
         }
         match p.done {
@@ -268,7 +330,10 @@ impl Core {
                     self.reply(link, req_id, Response::Error(code));
                 }
             },
-            Done::Ctap { reply, .. } => {
+            Done::Ctap { reply, session_mark, .. } => {
+                if let (Outcome::Approved, Some(k)) = (outcome, session_mark) {
+                    self.session_approved.insert(k);
+                }
                 let r = match outcome {
                     Outcome::Approved => PresenceResult::Approved,
                     Outcome::Timeout => PresenceResult::Timeout,
@@ -365,6 +430,7 @@ impl Core {
         let time_ok = self.clock.is_valid();
         Some(match req {
             ListEntries { kind } => R::Entries(self.vault.as_ref()?.list_summaries(kind)),
+            ListPasskeys => R::Passkeys(self.vault.as_ref()?.passkey_identities()),
             GetSecret { id, field, .. } => match self.vault.as_ref()?.get_entry(&id).and_then(|e| secret_value(e, field)) {
                 Some(v) => R::Secret(v),
                 None => R::Error(ErrorCode::InvalidRequest),
@@ -411,7 +477,7 @@ impl Core {
             }
             DeleteEntry { id } => match self.vault.as_mut()?.delete_entry(&id) {
                 Ok(_) => {
-                    self.session_approved.remove(&id);
+                    self.session_approved.remove(&SessionKey::Entry(id));
                     Self::ok_or_err(self.persist())
                 }
                 Err(_) => R::Error(ErrorCode::NotFound),
@@ -466,6 +532,31 @@ impl Core {
                 }
                 return Some(resp);
             }
+            PasswordSnapshot => {
+                let now = self.stamp();
+                let snap = self.vault.as_ref()?.password_snapshot(now, self.settings.password_cache_secs);
+                match postcard::to_stdvec(&snap) {
+                    Ok(b) => {
+                        let total_len = b.len() as u32;
+                        self.export = Some(Zeroizing::new(b));
+                        self.transfer_owner = Some(link);
+                        R::ExportReady { total_len }
+                    }
+                    Err(_) => R::Error(ErrorCode::Internal),
+                }
+            }
+            SetEntryPolicy { id, policy } => {
+                let v = self.vault.as_mut()?;
+                let Some(mut e) = v.get_entry(&id).cloned() else { return err(ErrorCode::NotFound) };
+                e.policy = policy;
+                match v.update_entry(e) {
+                    Ok(()) => {
+                        self.session_approved.remove(&SessionKey::Entry(id));
+                        Self::ok_or_err(self.persist())
+                    }
+                    Err(_) => R::Error(ErrorCode::NotFound),
+                }
+            }
             ExportChunk { .. } | ImportChunk { .. } if self.transfer_owner != Some(link) => {
                 R::Error(ErrorCode::InvalidRequest)
             }
@@ -501,6 +592,22 @@ impl Core {
                 if self.hosts.len() == n {
                     return err(ErrorCode::NotFound);
                 }
+                if let Err(e) = self.store().set_hosts(&self.hosts) {
+                    log::error!("saving hosts: {e:#}");
+                    return err(ErrorCode::Internal);
+                }
+                self.ui(UiEvent::PairedHosts(self.hosts.clone()));
+                R::Ok
+            }
+            RenamePairedHost { public_key, label } => {
+                let label = clean(label.trim(), 32);
+                if label.is_empty() {
+                    return err(ErrorCode::InvalidRequest);
+                }
+                let Some(h) = self.hosts.iter_mut().find(|h| h.public_key == public_key) else {
+                    return err(ErrorCode::NotFound);
+                };
+                h.label = label;
                 if let Err(e) = self.store().set_hosts(&self.hosts) {
                     log::error!("saving hosts: {e:#}");
                     return err(ErrorCode::Internal);
@@ -617,7 +724,7 @@ impl Core {
         match export::export(v.seed(), &v.vault, &passphrase, KdfParams::EXPORT, now, &mut self.rng) {
             Ok(file) => {
                 let total_len = file.len() as u32;
-                self.export = Some(file);
+                self.export = Some(Zeroizing::new(file));
                 Response::ExportReady { total_len }
             }
             Err(e) => {
@@ -734,7 +841,16 @@ impl Core {
                     context: clean(&context, 80),
                     timeout_secs: APPROVAL_TIMEOUT.as_secs() as u32,
                 };
-                if let Err(Done::Ctap { reply, .. }) = self.approval_submit(ui, Done::Ctap { link, reply }) {
+                // Sign-in may be once per unlock (passkey default); registration etc. always ask.
+                let session = req.kind == PresenceKind::Authenticate
+                    && self.settings.approvals.get(ApprovalOp::Passkey) == ApprovalPolicy::Session;
+                let key = SessionKey::Op(ApprovalOp::Passkey);
+                if session && self.session_approved.contains(&key) {
+                    let _ = reply.send(PresenceResult::Approved);
+                    return;
+                }
+                let session_mark = session.then_some(key);
+                if let Err(Done::Ctap { reply, .. }) = self.approval_submit(ui, Done::Ctap { link, reply, session_mark }) {
                     let _ = reply.send(PresenceResult::Denied);
                 }
             }

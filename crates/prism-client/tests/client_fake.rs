@@ -120,6 +120,10 @@ async fn crud_secret_totp_ssh() {
     assert_eq!(dev.settings().auto_lock_secs, 60);
     let hosts = c.list_paired_hosts().await.unwrap();
     assert_eq!(hosts.len(), 1);
+    c.rename_paired_host(hosts[0].public_key, "  Work laptop ").await.unwrap();
+    assert_eq!(c.list_paired_hosts().await.unwrap()[0].label, "Work laptop");
+    assert!(matches!(c.rename_paired_host(hosts[0].public_key, " ").await, Err(Error::Device(prism_proto::ErrorCode::InvalidRequest))));
+    assert!(matches!(c.rename_paired_host([1; 32], "x").await, Err(Error::Device(prism_proto::ErrorCode::NotFound))));
 }
 
 #[tokio::test]
@@ -179,4 +183,71 @@ fn host_key_and_config_persist() {
     let cfg2 = p.load_config().unwrap();
     assert_eq!(cfg2.pinned_device(), Some([9; 32]));
     assert_eq!(cfg2.last_ble_id.as_deref(), Some("abc"));
+}
+
+#[tokio::test]
+async fn list_passkeys_returns_public_identifiers_only() {
+    let dev = FakeDevice::new();
+    let (mut c, _) = paired(&dev).await;
+    c.add_entry(pw_entry("github")).await.unwrap();
+    c.add_entry(Entry {
+        id: EntryId([0x5c; 16]),
+        title: "example.org".into(),
+        tags: vec![],
+        created: 1,
+        modified: 1,
+        policy: ApprovalPolicy::Always,
+        data: EntryData::Passkey(Passkey {
+            rp_id: "example.org".into(),
+            rp_name: "Example".into(),
+            user_handle: vec![1, 2, 3],
+            user_name: "alice@example.org".into(),
+            user_display_name: "Alice".into(),
+            credential_id: vec![9; 16],
+            alg: CoseAlg::Es256,
+            key_nonce: [7; 16],
+            created: 1,
+        }),
+    })
+    .await
+    .unwrap();
+    let pk = c.list_passkeys().await.unwrap();
+    assert_eq!(
+        pk,
+        vec![PasskeyIdentity {
+            id: EntryId([0x5c; 16]),
+            rp_id: "example.org".into(),
+            user_name: "alice@example.org".into(),
+            user_handle: vec![1, 2, 3],
+            credential_id: vec![9; 16],
+        }]
+    );
+    c.lock().await.unwrap();
+    assert!(matches!(c.list_passkeys().await, Err(Error::Device(prism_proto::ErrorCode::Locked))));
+}
+
+#[tokio::test]
+async fn password_snapshot_and_entry_policy() {
+    let dev = FakeDevice::new();
+    let (mut c, _) = paired(&dev).await;
+    c.sync_time().await.unwrap();
+    let id = c.add_entry(pw_entry("github")).await.unwrap();
+    c.add_entry(Entry { id: EntryId([0xaa; 16]), data: EntryData::Totp(totp::parse_otpauth("otpauth://totp/Ex:bob?secret=GEZDGNBVGY3TQOJQ&issuer=Ex").unwrap()), ..pw_entry("totp") })
+        .await
+        .unwrap();
+    // Caching is off by default.
+    assert!(matches!(c.password_snapshot().await, Err(Error::Device(prism_proto::ErrorCode::Unsupported))));
+    let mut s = c.get_settings().await.unwrap();
+    s.password_cache_secs = 3600;
+    s.approvals.password = ApprovalPolicy::Session;
+    c.set_settings(s).await.unwrap();
+    let snap = c.password_snapshot().await.unwrap();
+    assert_eq!(snap.entries.len(), 1, "passwords only");
+    assert_eq!(snap.entries[0].password, "s3cret");
+    assert_eq!(snap.expires_at - snap.generated_at, 3600);
+
+    c.set_entry_policy(id, ApprovalPolicy::Default).await.unwrap();
+    let e = c.list(None).await.unwrap().into_iter().find(|e| e.id == id).unwrap();
+    assert_eq!(e.policy, ApprovalPolicy::Default);
+    assert!(matches!(c.set_entry_policy(EntryId([3; 16]), ApprovalPolicy::Never).await, Err(Error::Device(prism_proto::ErrorCode::NotFound))));
 }

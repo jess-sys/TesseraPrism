@@ -321,6 +321,47 @@ impl UnlockedVault {
             .collect()
     }
 
+    /// Every password entry, for a companion's local cache.
+    pub fn password_snapshot(&self, now: u64, ttl_secs: u32) -> PasswordSnapshot {
+        PasswordSnapshot {
+            generated_at: now,
+            expires_at: now + ttl_secs as u64,
+            entries: self
+                .vault
+                .entries
+                .iter()
+                .filter_map(|e| match &e.data {
+                    EntryData::Password(p) => Some(CachedPassword {
+                        id: e.id,
+                        title: e.title.clone(),
+                        username: p.username.clone(),
+                        password: p.password.clone(),
+                        url: p.url.clone(),
+                        modified: e.modified,
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn passkey_identities(&self) -> Vec<PasskeyIdentity> {
+        self.vault
+            .entries
+            .iter()
+            .filter_map(|e| match &e.data {
+                EntryData::Passkey(p) => Some(PasskeyIdentity {
+                    id: e.id,
+                    rp_id: p.rp_id.clone(),
+                    user_name: p.user_name.clone(),
+                    user_handle: p.user_handle.clone(),
+                    credential_id: p.credential_id.clone(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn find_by_kind(&self, kind: EntryKind) -> Vec<&Entry> {
         self.vault.entries.iter().filter(|e| e.kind() == kind).collect()
     }

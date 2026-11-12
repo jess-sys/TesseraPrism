@@ -44,6 +44,87 @@ pub enum ApprovalPolicy {
     Session,
     /// Never ask (still requires the device to be unlocked).
     Never,
+    /// Follow the device-wide default for the operation (`Settings::approvals`). Appended last
+    /// so stored vaults keep their encoding.
+    Default,
+}
+
+/// Operation categories with a configurable approval default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ApprovalOp {
+    /// Reveal / fetch a password, username or notes.
+    Password,
+    Totp,
+    SshSign,
+    /// Passkey sign-in (registration always asks). `Never` is treated as `Session`: the
+    /// authenticator must not claim user presence without any tap.
+    Passkey,
+    RecoveryCodes,
+    /// Type an entry over USB keyboard emulation.
+    TypeOverUsb,
+    /// Add or edit entries, generate SSH keys.
+    Modify,
+    Delete,
+}
+
+/// Device-wide approval defaults, one per `ApprovalOp`. Entries whose policy is
+/// `ApprovalPolicy::Default` follow these; others override them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalDefaults {
+    pub password: ApprovalPolicy,
+    pub totp: ApprovalPolicy,
+    pub ssh_sign: ApprovalPolicy,
+    pub passkey: ApprovalPolicy,
+    pub recovery_codes: ApprovalPolicy,
+    pub type_over_usb: ApprovalPolicy,
+    pub modify: ApprovalPolicy,
+    pub delete: ApprovalPolicy,
+}
+
+impl Default for ApprovalDefaults {
+    fn default() -> Self {
+        use ApprovalPolicy::Always;
+        Self {
+            password: Always,
+            totp: Always,
+            ssh_sign: Always,
+            passkey: Always,
+            recovery_codes: Always,
+            type_over_usb: Always,
+            modify: Always,
+            delete: Always,
+        }
+    }
+}
+
+impl ApprovalDefaults {
+    /// The default for `op`, normalised (`Default` = `Always`; passkeys never `Never`).
+    pub fn get(&self, op: ApprovalOp) -> ApprovalPolicy {
+        let p = match op {
+            ApprovalOp::Password => self.password,
+            ApprovalOp::Totp => self.totp,
+            ApprovalOp::SshSign => self.ssh_sign,
+            ApprovalOp::Passkey => self.passkey,
+            ApprovalOp::RecoveryCodes => self.recovery_codes,
+            ApprovalOp::TypeOverUsb => self.type_over_usb,
+            ApprovalOp::Modify => self.modify,
+            ApprovalOp::Delete => self.delete,
+        };
+        match (op, p) {
+            (_, ApprovalPolicy::Default) => ApprovalPolicy::Always,
+            (ApprovalOp::Passkey, ApprovalPolicy::Never) => ApprovalPolicy::Session,
+            (_, p) => p,
+        }
+    }
+
+    /// Policy that applies to an entry with `entry_policy` for `op`.
+    pub fn effective(&self, entry_policy: ApprovalPolicy, op: ApprovalOp) -> ApprovalPolicy {
+        match (op, entry_policy) {
+            (_, ApprovalPolicy::Default) => self.get(op),
+            (ApprovalOp::Passkey, ApprovalPolicy::Never) => ApprovalPolicy::Session,
+            (_, p) => p,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +285,37 @@ pub struct EntrySummary {
     pub policy: ApprovalPolicy,
 }
 
+/// Public identifiers of a passkey, so a companion can register it with the OS credential
+/// store (e.g. Apple's `ASCredentialIdentityStore`). No key material.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasskeyIdentity {
+    pub id: EntryId,
+    pub rp_id: String,
+    pub user_name: String,
+    pub user_handle: Vec<u8>,
+    pub credential_id: Vec<u8>,
+}
+
+/// One password as sent to a companion's local cache (`Request::PasswordSnapshot`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct CachedPassword {
+    #[zeroize(skip)]
+    pub id: EntryId,
+    pub title: String,
+    pub username: String,
+    pub password: String,
+    pub url: Option<String>,
+    pub modified: u64,
+}
+
+/// Passwords for a companion's encrypted local cache. Companions must delete it at `expires_at`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct PasswordSnapshot {
+    pub generated_at: u64,
+    pub expires_at: u64,
+    pub entries: Vec<CachedPassword>,
+}
+
 /// The decrypted vault (lives in PSRAM only while unlocked).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Vault {
@@ -251,9 +363,10 @@ pub enum KeyboardLayout {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SleepMode {
     /// Lock, draw lock screen, cut power. Boot with the power button.
-    #[default]
     PowerOff,
-    /// Lock, stay BLE-connectable with automatic light sleep.
+    /// Lock, stay BLE-reachable in low-power standby (light sleep, slow advertising); a paired
+    /// app's request wakes the PIN pad. Powers off after 24 h on battery.
+    #[default]
     LightSleep,
 }
 
@@ -273,17 +386,48 @@ pub struct Settings {
     pub buzzer: bool,
     /// Shown on the lock screen if set.
     pub owner_info: Option<String>,
+    /// Approval defaults per operation type.
+    pub approvals: ApprovalDefaults,
+    /// How long a companion's password cache stays valid; 0 = caching disabled.
+    pub password_cache_secs: u32,
+}
+
+/// `Settings` before approval defaults and the password cache (for reading stored settings).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsV1 {
+    pub auto_lock_secs: u32,
+    pub sleep_mode: SleepMode,
+    pub keyboard_layout: KeyboardLayout,
+    pub orientation: Orientation,
+    pub buzzer: bool,
+    pub owner_info: Option<String>,
+}
+
+impl From<SettingsV1> for Settings {
+    fn from(v: SettingsV1) -> Self {
+        Self {
+            auto_lock_secs: v.auto_lock_secs,
+            sleep_mode: v.sleep_mode,
+            keyboard_layout: v.keyboard_layout,
+            orientation: v.orientation,
+            buzzer: v.buzzer,
+            owner_info: v.owner_info,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             auto_lock_secs: 180,
-            sleep_mode: SleepMode::PowerOff,
+            sleep_mode: SleepMode::LightSleep,
             keyboard_layout: KeyboardLayout::Us,
             orientation: Orientation::Portrait,
             buzzer: true,
             owner_info: None,
+            approvals: ApprovalDefaults::default(),
+            password_cache_secs: 0,
         }
     }
 }
@@ -315,4 +459,51 @@ pub struct DeviceInfo {
     pub charging: bool,
     pub entry_count: u32,
     pub time_valid: bool,
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_and_overrides() {
+        let mut d = ApprovalDefaults::default();
+        assert_eq!(d.effective(ApprovalPolicy::Default, ApprovalOp::Password), ApprovalPolicy::Always);
+        d.password = ApprovalPolicy::Never;
+        assert_eq!(d.effective(ApprovalPolicy::Default, ApprovalOp::Password), ApprovalPolicy::Never);
+        assert_eq!(d.effective(ApprovalPolicy::Session, ApprovalOp::Password), ApprovalPolicy::Session, "entry overrides");
+        // Passkeys never skip presence entirely.
+        d.passkey = ApprovalPolicy::Never;
+        assert_eq!(d.get(ApprovalOp::Passkey), ApprovalPolicy::Session);
+        assert_eq!(d.effective(ApprovalPolicy::Never, ApprovalOp::Passkey), ApprovalPolicy::Session);
+        d.modify = ApprovalPolicy::Default;
+        assert_eq!(d.get(ApprovalOp::Modify), ApprovalPolicy::Always);
+    }
+
+    #[test]
+    fn old_settings_encoding_still_reads() {
+        let v1 = SettingsV1 {
+            auto_lock_secs: 60,
+            sleep_mode: SleepMode::PowerOff,
+            keyboard_layout: KeyboardLayout::FrAzerty,
+            orientation: Orientation::Portrait,
+            buzzer: false,
+            owner_info: Some("alice@example.org".into()),
+        };
+        let b = postcard::to_stdvec(&v1).unwrap();
+        assert!(postcard::from_bytes::<Settings>(&b).is_err());
+        let s: Settings = postcard::from_bytes::<SettingsV1>(&b).unwrap().into();
+        assert_eq!(s.auto_lock_secs, 60);
+        assert_eq!(s.owner_info.as_deref(), Some("alice@example.org"));
+        assert_eq!(s.approvals, ApprovalDefaults::default());
+        assert_eq!(s.password_cache_secs, 0);
+    }
+
+    #[test]
+    fn approval_policy_encoding_is_append_only() {
+        // Stored vaults encode the policy by variant index.
+        for (p, i) in [(ApprovalPolicy::Always, 0u8), (ApprovalPolicy::Session, 1), (ApprovalPolicy::Never, 2), (ApprovalPolicy::Default, 3)] {
+            assert_eq!(postcard::to_stdvec(&p).unwrap(), vec![i]);
+        }
+    }
 }

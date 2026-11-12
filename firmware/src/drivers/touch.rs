@@ -80,6 +80,22 @@ impl Gt911 {
         Ok(())
     }
 
+    /// Put the controller into its sleep mode (command 0x05 to 0x8040): it stops scanning.
+    pub fn sleep(&mut self) -> Result<()> {
+        self.write_reg(0x8040, &[0x05])
+    }
+
+    /// Wake from sleep: drive INT high for a few ms, then release it as an input again.
+    pub fn wake(&mut self) {
+        unsafe {
+            sys::gpio_set_direction(board::TOUCH_INT, sys::gpio_mode_t_GPIO_MODE_OUTPUT);
+            sys::gpio_set_level(board::TOUCH_INT, 1);
+            sys::esp_rom_delay_us(5000);
+            sys::gpio_set_direction(board::TOUCH_INT, sys::gpio_mode_t_GPIO_MODE_INPUT);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(60));
+    }
+
     /// True while INT is asserted (low) — new data may be available.
     pub fn data_pending(&self) -> bool {
         unsafe { sys::gpio_get_level(board::TOUCH_INT) == 0 }

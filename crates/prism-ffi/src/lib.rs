@@ -185,12 +185,44 @@ pub fn totp_now(json_totp: String, unix: u64) -> Result<String, PrismError> {
     logic::totp_now(&json_totp, unix).map_err(PrismError::InvalidInput)
 }
 
+/// Decode the bytes read via `PasswordSnapshot` + `ExportChunk` (postcard) into JSON:
+/// `{"generated_at":..,"expires_at":..,"entries":[{"id":[16 bytes],"title","username","password","url","modified"}]}`.
+#[uniffi::export]
+pub fn decode_password_snapshot(bytes: Vec<u8>) -> Result<String, PrismError> {
+    let bytes = zeroize::Zeroizing::new(bytes);
+    let snap: prism_core::model::PasswordSnapshot =
+        postcard::from_bytes(&bytes).map_err(|e| PrismError::InvalidInput(format!("password snapshot: {e}")))?;
+    serde_json::to_string(&snap).map_err(|e| PrismError::InvalidInput(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use prism_proto::session::{DeviceEvent, DeviceSession};
     use prism_proto::{generate_static_keypair, Envelope, ErrorCode, Request, Response};
     use serde_json::{json, Value};
+
+    #[test]
+    fn password_snapshot_decodes_to_json() {
+        use prism_core::model::{CachedPassword, EntryId, PasswordSnapshot};
+        let snap = PasswordSnapshot {
+            generated_at: 10,
+            expires_at: 20,
+            entries: vec![CachedPassword {
+                id: EntryId([1; 16]),
+                title: "example.org".into(),
+                username: "alice".into(),
+                password: "pw".into(),
+                url: Some("https://example.org".into()),
+                modified: 5,
+            }],
+        };
+        let v: Value = serde_json::from_str(&decode_password_snapshot(postcard::to_stdvec(&snap).unwrap()).unwrap()).unwrap();
+        assert_eq!(v["expires_at"], 20);
+        assert_eq!(v["entries"][0]["password"], "pw");
+        assert_eq!(v["entries"][0]["id"], json!(vec![1u8; 16]));
+        assert!(decode_password_snapshot(vec![0xff, 0xff]).is_err());
+    }
 
     #[test]
     fn handshake_sas_and_request_roundtrip_via_json_api() {

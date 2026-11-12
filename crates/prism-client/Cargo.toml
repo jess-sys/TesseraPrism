@@ -19,6 +19,7 @@ prism-proto.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+postcard.workspace = true
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "sync", "time", "io-util", "macros", "fs"] }
 tokio-serial = "5"

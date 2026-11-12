@@ -35,6 +35,8 @@ public protocol PrismCore: AnyObject {
     func parseOtpauth(_ uri: String) throws -> String
     /// JSON Totp + unix time -> code
     func totpNow(totpJSON: String, unix: UInt64) throws -> String
+    /// postcard bytes of a `PasswordSnapshot` (read via ExportChunk) -> JSON.
+    func decodePasswordSnapshot(bytes: Data) throws -> String
 }
 
 public enum PrismCoreError: Error, LocalizedError {
@@ -91,6 +93,12 @@ public final class StubCore: PrismCore {
 
     public func totpNow(totpJSON: String, unix: UInt64) throws -> String {
         throw PrismCoreError.unsupported("totpNow requires prism-ffi")
+    }
+
+    /// The stub transport carries snapshots as JSON already.
+    public func decodePasswordSnapshot(bytes: Data) throws -> String {
+        guard let s = String(data: bytes, encoding: .utf8) else { throw PrismCoreError.unsupported("snapshot is not JSON") }
+        return s
     }
 
     // Helpers for fake devices

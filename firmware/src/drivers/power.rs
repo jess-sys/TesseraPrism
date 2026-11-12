@@ -291,33 +291,77 @@ fn ms_to_ticks(ms: u32) -> u32 {
 }
 
 /// Piezo buzzer on GPIO21 driven by LEDC (low-speed timer 3 / channel 7, 10-bit).
+/// Passive piezo on LEDC (timer 3 / channel 7). Configured once; pitch and loudness are then
+/// changed on the fly, which allows envelopes (soft attack, bell-like decay) and pitch glides
+/// instead of hard-edged square-wave beeps.
 pub struct Buzzer;
 
+static BUZZER_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const BUZZER_MODE: sys::ledc_mode_t = sys::ledc_mode_t_LEDC_LOW_SPEED_MODE;
+const BUZZER_TIMER: sys::ledc_timer_t = sys::ledc_timer_t_LEDC_TIMER_3;
+const BUZZER_CHANNEL: sys::ledc_channel_t = sys::ledc_channel_t_LEDC_CHANNEL_7;
+/// 10-bit duty; 50 % (512) is the loudest a piezo gets.
+pub const BUZZER_MAX_DUTY: u32 = 512;
+
 impl Buzzer {
-    /// Blocking beep.
-    pub fn beep(freq_hz: u32, duration_ms: u32) -> Result<()> {
+    fn ensure_init(freq_hz: u32) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if BUZZER_READY.load(Ordering::Acquire) {
+            return Ok(());
+        }
         unsafe {
             let mut timer: sys::ledc_timer_config_t = core::mem::zeroed();
-            timer.speed_mode = sys::ledc_mode_t_LEDC_LOW_SPEED_MODE;
+            timer.speed_mode = BUZZER_MODE;
             timer.duty_resolution = sys::ledc_timer_bit_t_LEDC_TIMER_10_BIT;
-            timer.timer_num = sys::ledc_timer_t_LEDC_TIMER_3;
+            timer.timer_num = BUZZER_TIMER;
             timer.freq_hz = freq_hz;
             timer.clk_cfg = sys::soc_periph_ledc_clk_src_legacy_t_LEDC_AUTO_CLK;
             sys::esp!(sys::ledc_timer_config(&timer))?;
             let mut ch: sys::ledc_channel_config_t = core::mem::zeroed();
             ch.gpio_num = board::BUZZER;
-            ch.speed_mode = sys::ledc_mode_t_LEDC_LOW_SPEED_MODE;
-            ch.channel = sys::ledc_channel_t_LEDC_CHANNEL_7;
-            ch.timer_sel = sys::ledc_timer_t_LEDC_TIMER_3;
-            ch.duty = 512; // 50 %
+            ch.speed_mode = BUZZER_MODE;
+            ch.channel = BUZZER_CHANNEL;
+            ch.timer_sel = BUZZER_TIMER;
+            ch.duty = 0;
             sys::esp!(sys::ledc_channel_config(&ch))?;
-            sys::vTaskDelay(ms_to_ticks(duration_ms).max(1));
-            sys::esp!(sys::ledc_stop(
-                sys::ledc_mode_t_LEDC_LOW_SPEED_MODE,
-                sys::ledc_channel_t_LEDC_CHANNEL_7,
-                0
-            ))?;
+        }
+        BUZZER_READY.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Set pitch and loudness (duty 0..=BUZZER_MAX_DUTY; 0 = silent). Non-blocking.
+    pub fn set(freq_hz: u32, duty: u32) -> Result<()> {
+        let freq_hz = freq_hz.clamp(200, 8000);
+        Self::ensure_init(freq_hz)?;
+        unsafe {
+            // Reprogramming the timer is only needed (and only glitch-free) on actual changes.
+            static LAST_FREQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if duty > 0 && LAST_FREQ.swap(freq_hz, std::sync::atomic::Ordering::Relaxed) != freq_hz {
+                sys::esp!(sys::ledc_set_freq(BUZZER_MODE, BUZZER_TIMER, freq_hz))?;
+            }
+            sys::esp!(sys::ledc_set_duty(BUZZER_MODE, BUZZER_CHANNEL, duty.min(BUZZER_MAX_DUTY)))?;
+            sys::esp!(sys::ledc_update_duty(BUZZER_MODE, BUZZER_CHANNEL))?;
         }
         Ok(())
+    }
+
+    /// Silence (pin held low).
+    pub fn off() -> Result<()> {
+        if !BUZZER_READY.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        unsafe {
+            sys::esp!(sys::ledc_set_duty(BUZZER_MODE, BUZZER_CHANNEL, 0))?;
+            sys::esp!(sys::ledc_update_duty(BUZZER_MODE, BUZZER_CHANNEL))?;
+        }
+        Ok(())
+    }
+
+    /// Blocking flat beep (kept for simple callers).
+    pub fn beep(freq_hz: u32, duration_ms: u32) -> Result<()> {
+        Self::set(freq_hz, BUZZER_MAX_DUTY)?;
+        unsafe { sys::vTaskDelay(ms_to_ticks(duration_ms).max(1)) };
+        Self::off()
     }
 }

@@ -60,7 +60,10 @@ impl UiTask {
         let mut next_tick = Instant::now() + Duration::from_secs(1);
         let mut lock_drawn_pending = false;
         loop {
-            let wait = next_tick.saturating_duration_since(Instant::now());
+            let on_lock = self.ui.screen_name() == "lock";
+            crate::touch_task::set_active(!on_lock);
+            // Lock screen: static, so no 1 Hz tick (keeps the CPU in light sleep in standby).
+            let wait = if on_lock { Duration::from_secs(60) } else { next_tick.saturating_duration_since(Instant::now()) };
             match self.rx.recv_timeout(wait) {
                 Ok(m) => {
                     lock_drawn_pending |= self.on_msg(m);
@@ -72,7 +75,7 @@ impl UiTask {
                 Err(RecvTimeoutError::Disconnected) => return,
             }
 
-            if Instant::now() >= next_tick {
+            if !on_lock && Instant::now() >= next_tick {
                 next_tick += Duration::from_secs(1);
                 if next_tick < Instant::now() {
                     next_tick = Instant::now() + Duration::from_secs(1);
@@ -123,7 +126,7 @@ impl UiTask {
                 UiAction::Activity => {
                     let _ = self.power.send(PowerMsg::Activity);
                 }
-                UiAction::InvalidInput => crate::sound::play(crate::sound::Sound::Error),
+                UiAction::InvalidInput => crate::sound::play(crate::sound::Sound::Invalid),
                 a => {
                     let _ = self.core.send(CoreMsg::Ui(a));
                 }

@@ -282,8 +282,9 @@ impl Core {
                     log::warn!("too many wrong PINs: wiping");
                     self.wipe();
                 } else {
-                    self.sound(crate::sound::Sound::Error);
-                    self.ui(UiEvent::PinRejected { attempts_left: MAX_PIN_FAILS - used });
+                    let left = MAX_PIN_FAILS - used;
+                    self.sound(if left <= 3 { crate::sound::Sound::LastChances } else { crate::sound::Sound::Error });
+                    self.ui(UiEvent::PinRejected { attempts_left: left });
                 }
             }
             Err(CoreError::Kdf(e)) => {
@@ -422,6 +423,9 @@ impl Core {
         self.power(PowerMsg::Settings(self.settings.clone()));
         self.ui(UiEvent::BootComplete { initialized: false });
         self.set_mode(Mode::Setup);
+        // Settings were reset (buzzer back on): this one is always heard.
+        crate::sound::set_enabled(true);
+        self.sound(crate::sound::Sound::Wiped);
         log::warn!("device wiped");
     }
 }

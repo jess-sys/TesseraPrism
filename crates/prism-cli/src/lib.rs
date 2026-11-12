@@ -2,6 +2,7 @@
 //! The binary (`main.rs`) only wires up the real transport; tests drive [`run`] with a fake device.
 
 pub mod agent;
+pub mod cache;
 pub mod install;
 pub mod known_hosts;
 
@@ -60,6 +61,8 @@ pub struct Env {
     pub out: Mutex<Box<dyn Write + Send>>,
     /// Send SetTime after connecting (default true).
     pub time_sync: bool,
+    /// Holds the password-cache key (OS keychain; tests inject memory).
+    pub keys: Box<dyn cache::KeyStore>,
 }
 
 impl Env {
@@ -70,6 +73,7 @@ impl Env {
             prompter: Box::new(TtyPrompter),
             out: Mutex::new(Box::new(std::io::stdout())),
             time_sync: true,
+            keys: Box::new(cache::KeyringStore),
         }
     }
 
@@ -184,6 +188,8 @@ pub enum PolicyArg {
     Always,
     Session,
     Never,
+    /// Follow the device-wide default (`prism approvals`).
+    Default,
 }
 impl From<PolicyArg> for ApprovalPolicy {
     fn from(p: PolicyArg) -> Self {
@@ -191,8 +197,98 @@ impl From<PolicyArg> for ApprovalPolicy {
             PolicyArg::Always => ApprovalPolicy::Always,
             PolicyArg::Session => ApprovalPolicy::Session,
             PolicyArg::Never => ApprovalPolicy::Never,
+            PolicyArg::Default => ApprovalPolicy::Default,
         }
     }
+}
+
+/// Policy values accepted by `prism approvals set` (device-wide defaults are never `default`).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum DefaultPolicyArg {
+    Always,
+    Session,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum OpArg {
+    Password,
+    Totp,
+    Ssh,
+    Passkey,
+    Recovery,
+    Type,
+    Modify,
+    Delete,
+}
+impl OpArg {
+    const ALL: [OpArg; 8] = [Self::Password, Self::Totp, Self::Ssh, Self::Passkey, Self::Recovery, Self::Type, Self::Modify, Self::Delete];
+    fn name(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::Totp => "totp",
+            Self::Ssh => "ssh",
+            Self::Passkey => "passkey",
+            Self::Recovery => "recovery",
+            Self::Type => "type",
+            Self::Modify => "modify",
+            Self::Delete => "delete",
+        }
+    }
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Password => "Reveal a password / username / notes",
+            Self::Totp => "Generate a TOTP code",
+            Self::Ssh => "Sign with an SSH key",
+            Self::Passkey => "Passkey sign-in",
+            Self::Recovery => "Reveal recovery codes",
+            Self::Type => "Type over USB keyboard",
+            Self::Modify => "Add / edit entries",
+            Self::Delete => "Delete entries",
+        }
+    }
+    fn op(self) -> ApprovalOp {
+        match self {
+            Self::Password => ApprovalOp::Password,
+            Self::Totp => ApprovalOp::Totp,
+            Self::Ssh => ApprovalOp::SshSign,
+            Self::Passkey => ApprovalOp::Passkey,
+            Self::Recovery => ApprovalOp::RecoveryCodes,
+            Self::Type => ApprovalOp::TypeOverUsb,
+            Self::Modify => ApprovalOp::Modify,
+            Self::Delete => ApprovalOp::Delete,
+        }
+    }
+    fn slot(self, d: &mut ApprovalDefaults) -> &mut ApprovalPolicy {
+        match self {
+            Self::Password => &mut d.password,
+            Self::Totp => &mut d.totp,
+            Self::Ssh => &mut d.ssh_sign,
+            Self::Passkey => &mut d.passkey,
+            Self::Recovery => &mut d.recovery_codes,
+            Self::Type => &mut d.type_over_usb,
+            Self::Modify => &mut d.modify,
+            Self::Delete => &mut d.delete,
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ApprovalsCmd {
+    /// Set the device-wide default for one operation (confirm on the device).
+    Set { op: OpArg, policy: DefaultPolicyArg },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CacheCmd {
+    /// Download all passwords into the encrypted local cache (confirm on the device).
+    Sync,
+    /// Show cache entry count, age and expiry.
+    Status,
+    /// Delete the cache and its keychain key.
+    Clear,
+    /// Set how long a synced cache stays valid: off, 1h, 1d, 7d, 30d or N[smhd] (confirm on the device).
+    Ttl { duration: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -217,7 +313,24 @@ pub enum Cmd {
         /// Copy to the clipboard (cleared after 30 s) instead of printing.
         #[arg(long)]
         copy: bool,
+        /// Use the encrypted local password cache without contacting the device.
+        #[arg(long)]
+        offline: bool,
     },
+    /// Show or change device-wide approval defaults per operation.
+    Approvals {
+        #[command(subcommand)]
+        cmd: Option<ApprovalsCmd>,
+    },
+    /// Change one entry's approval policy (confirm on the device).
+    Policy {
+        entry: String,
+        #[arg(value_enum)]
+        policy: PolicyArg,
+    },
+    /// Encrypted local password cache for offline use.
+    #[command(subcommand)]
+    Cache(CacheCmd),
     /// Add an entry.
     #[command(subcommand)]
     Add(AddCmd),
@@ -226,7 +339,7 @@ pub enum Cmd {
         name: String,
         #[arg(long, default_value = "")]
         comment: String,
-        #[arg(long, value_enum, default_value_t = PolicyArg::Always)]
+        #[arg(long, value_enum, default_value_t = PolicyArg::Default)]
         policy: PolicyArg,
     },
     /// Print the OpenSSH public key of an SSH key entry.
@@ -279,7 +392,7 @@ pub enum AddCmd {
         /// Print the generated password.
         #[arg(long)]
         print: bool,
-        #[arg(long, value_enum, default_value_t = PolicyArg::Always)]
+        #[arg(long, value_enum, default_value_t = PolicyArg::Default)]
         policy: PolicyArg,
     },
     /// Add a TOTP from an otpauth:// URI or a base32 secret.
@@ -294,7 +407,7 @@ pub enum AddCmd {
         issuer: Option<String>,
         #[arg(long)]
         account: Option<String>,
-        #[arg(long, value_enum, default_value_t = PolicyArg::Always)]
+        #[arg(long, value_enum, default_value_t = PolicyArg::Default)]
         policy: PolicyArg,
     },
     /// Add recovery codes (one per line from a file, or stdin).
@@ -303,7 +416,7 @@ pub enum AddCmd {
         /// File with codes; default stdin.
         #[arg(long)]
         file: Option<PathBuf>,
-        #[arg(long, value_enum, default_value_t = PolicyArg::Always)]
+        #[arg(long, value_enum, default_value_t = PolicyArg::Default)]
         policy: PolicyArg,
     },
     /// Import an OpenSSH Ed25519 private key.
@@ -311,7 +424,7 @@ pub enum AddCmd {
         file: PathBuf,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long, value_enum, default_value_t = PolicyArg::Always)]
+        #[arg(long, value_enum, default_value_t = PolicyArg::Default)]
         policy: PolicyArg,
     },
 }
@@ -337,6 +450,8 @@ pub enum HostsCmd {
     Ls,
     /// Remove a paired host by list index or public key hex prefix.
     Rm { host: String },
+    /// Rename a paired host (list index or public key hex prefix). Confirm on the device.
+    Rename { host: String, label: String },
 }
 
 #[derive(Args, Debug)]
@@ -373,14 +488,137 @@ fn short_id(id: &EntryId) -> String {
     id.to_hex()[..8].to_string()
 }
 
-fn summary_json(s: &EntrySummary) -> serde_json::Value {
-    json!({
+fn op_for_kind(k: EntryKind) -> ApprovalOp {
+    match k {
+        EntryKind::Password => ApprovalOp::Password,
+        EntryKind::Totp => ApprovalOp::Totp,
+        EntryKind::Passkey => ApprovalOp::Passkey,
+        EntryKind::SshKey => ApprovalOp::SshSign,
+        EntryKind::RecoveryCodes => ApprovalOp::RecoveryCodes,
+    }
+}
+
+fn policy_word(p: ApprovalPolicy) -> &'static str {
+    match p {
+        ApprovalPolicy::Always => "always",
+        ApprovalPolicy::Session => "session",
+        ApprovalPolicy::Never => "never",
+        ApprovalPolicy::Default => "default",
+    }
+}
+
+/// "always", or "default (session)" when the entry follows a known device default.
+fn policy_label(s: &EntrySummary, defaults: Option<&ApprovalDefaults>) -> String {
+    match (s.policy, defaults) {
+        (ApprovalPolicy::Default, Some(d)) => format!("default ({})", policy_word(d.effective(s.policy, op_for_kind(s.kind)))),
+        (p, _) => policy_word(p).to_string(),
+    }
+}
+
+fn summary_json(s: &EntrySummary, defaults: Option<&ApprovalDefaults>) -> serde_json::Value {
+    let mut v = json!({
         "id": s.id.to_hex(), "kind": s.kind, "title": s.title, "subtitle": s.subtitle, "url": s.url,
         "tags": s.tags, "modified": s.modified, "has_totp": s.has_totp, "policy": s.policy,
+    });
+    if let Some(d) = defaults {
+        v["effective_policy"] = json!(policy_word(d.effective(s.policy, op_for_kind(s.kind))));
+    }
+    v
+}
+
+fn approvals_json(d: &ApprovalDefaults) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for op in OpArg::ALL {
+        m.insert(op.name().into(), json!(policy_word(d.get(op.op()))));
+    }
+    m.into()
+}
+
+fn is_offline_error(e: &anyhow::Error) -> bool {
+    use prism_client::Error as E;
+    e.chain().any(|c| {
+        matches!(c.downcast_ref::<E>(), Some(E::NoDevice(_) | E::Timeout | E::Closed | E::Transport(_) | E::Io(_)))
     })
 }
 
+fn is_not_paired(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| matches!(c.downcast_ref::<prism_client::Error>(), Some(prism_client::Error::NotPaired)))
+}
+
+/// Our own host public key (what the device lists under paired hosts).
+fn host_pubkey(paths: &Paths) -> Result<[u8; 32]> {
+    let seed = paths.load_or_create_host_key()?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes())
+}
+
+impl Env {
+    /// The password cache for the pinned device, if this host knows one.
+    fn pw_cache(&self) -> Result<cache::PasswordCache<'_>> {
+        let dev = self
+            .paths
+            .load_config()?
+            .pinned_device()
+            .ok_or_else(|| anyhow!("no device is paired with this host yet; run `prism pair`"))?;
+        Ok(cache::PasswordCache::new(&self.paths.dir, &*self.keys, dev))
+    }
+
+    /// Best-effort deletion (NotPaired, host removal).
+    fn drop_cache(&self) {
+        if let Ok(c) = self.pw_cache() {
+            let _ = c.clear();
+        }
+    }
+}
+
+/// Serve `show` from the local cache. Only password username/password fields; never TOTP/SSH/passkeys.
+async fn show_from_cache(env: &Env, json: bool, entry: &str, field: Option<FieldArg>, copy: bool) -> Result<()> {
+    let c = env.pw_cache()?;
+    let now = now_unix();
+    let snap = match c.load(now)? {
+        cache::Loaded::Missing => bail!("no local password cache; run `prism cache sync` while the device is connected"),
+        cache::Loaded::Expired => bail!("cache expired, run `prism cache sync`"),
+        cache::Loaded::Ok(s, _) => s,
+    };
+    let list: Vec<EntrySummary> = snap
+        .entries
+        .iter()
+        .map(|e| EntrySummary {
+            id: e.id,
+            kind: EntryKind::Password,
+            title: e.title.clone(),
+            subtitle: e.username.clone(),
+            url: e.url.clone(),
+            tags: vec![],
+            modified: e.modified,
+            has_totp: false,
+            policy: ApprovalPolicy::Default,
+        })
+        .collect();
+    let s = resolve(&list, entry)?;
+    let e = snap.entries.iter().find(|e| e.id == s.id).expect("resolved from this list");
+    let (label, value) = match field.map(SecretField::from).unwrap_or(SecretField::Password) {
+        SecretField::Password => ("Password", e.password.clone()),
+        SecretField::Username => ("Username", e.username.clone()),
+        _ => bail!("only the password and username can be read from the local cache"),
+    };
+    eprintln!("(from local cache, expires in {})", cache::fmt_duration(snap.expires_at.saturating_sub(now)));
+    output_secret(env, json, label, value, copy).await
+}
+
 /// Resolve `<id|title>`: hex id prefix, exact title (case-insensitive), then unique substring.
+/// A paired host by list index or public key hex prefix.
+fn find_host<'a>(hosts: &'a [PairedHost], key: &str) -> Result<&'a PairedHost> {
+    if let Some(h) = key.parse::<usize>().ok().and_then(|i| hosts.get(i)) {
+        return Ok(h);
+    }
+    let m: Vec<_> = hosts.iter().filter(|h| hex::encode(h.public_key).starts_with(&key.to_lowercase())).collect();
+    match m.len() {
+        1 => Ok(m[0]),
+        0 => bail!("no paired host matching '{key}'"),
+        _ => bail!("'{key}' matches several hosts"),
+    }
+}
+
 pub fn resolve<'a>(list: &'a [EntrySummary], key: &str) -> Result<&'a EntrySummary> {
     let k = key.to_lowercase();
     let is_hex = k.len() >= 4 && k.chars().all(|c| c.is_ascii_hexdigit());
@@ -520,6 +758,7 @@ pub fn apply_setting(s: &mut Settings, key: &str, value: &str) -> Result<()> {
             }
         }
         "buzzer" => s.buzzer = parse_bool(value)?,
+        "password-cache" | "password-cache-secs" => s.password_cache_secs = cache::parse_duration(value)?,
         "owner-info" => s.owner_info = if value.is_empty() { None } else { Some(value.to_string()) },
         _ => bail!("unknown setting '{key}'"),
     }
@@ -530,13 +769,107 @@ fn settings_json(s: &Settings) -> serde_json::Value {
     json!({
         "auto-lock-secs": s.auto_lock_secs, "sleep-mode": format!("{:?}", s.sleep_mode),
         "keyboard-layout": format!("{:?}", s.keyboard_layout), "orientation": format!("{:?}", s.orientation),
-        "buzzer": s.buzzer, "owner-info": s.owner_info,
+        "buzzer": s.buzzer, "owner-info": s.owner_info, "password-cache-secs": s.password_cache_secs,
     })
 }
 
 // ---------------------------------------------------------------- run
 
 pub async fn run(cli: Cli, env: &Arc<Env>) -> Result<()> {
+    let r = run_inner(cli, env).await;
+    if let Err(e) = &r {
+        if is_not_paired(e) {
+            env.drop_cache();
+        }
+    }
+    r
+}
+
+async fn run_cache(env: &Arc<Env>, json: bool, cc: CacheCmd) -> Result<()> {
+    match cc {
+        CacheCmd::Sync => {
+            let mut c = env.connect().await?;
+            eprintln!("Confirm on your Prism...");
+            let snap = match c.password_snapshot().await {
+                Ok(s) => s,
+                Err(prism_client::Error::Device(prism_proto::ErrorCode::Unsupported)) => bail!(
+                    "Password caching is off on the device: enable it with `prism cache ttl <dur>` (e.g. 1d) \
+                     or `prism settings set password-cache <dur>`"
+                ),
+                Err(e) => return Err(e.into()),
+            };
+            let dev = c.device_pubkey();
+            let pc = cache::PasswordCache::new(&env.paths.dir, &*env.keys, dev);
+            let h = pc.store(&snap)?;
+            let left = h.expires_at.saturating_sub(now_unix());
+            if json {
+                env.say(json!({ "count": h.count, "generated_at": h.generated_at, "expires_at": h.expires_at }).to_string());
+            } else {
+                env.say(format!("Cached {} passwords, expires in {}.", h.count, cache::fmt_duration(left)));
+            }
+        }
+        CacheCmd::Status => {
+            let pc = env.pw_cache()?;
+            let now = now_unix();
+            match pc.header()? {
+                None => {
+                    if json {
+                        env.say(json!({ "cached": false }).to_string());
+                    } else {
+                        env.say("No local password cache. Run `prism cache sync`.");
+                    }
+                }
+                Some(h) => {
+                    let expired = now >= h.expires_at;
+                    if expired {
+                        pc.clear()?;
+                    }
+                    if json {
+                        env.say(
+                            json!({ "cached": !expired, "expired": expired, "count": h.count,
+                                "generated_at": h.generated_at, "expires_at": h.expires_at,
+                                "expires_in": h.expires_at.saturating_sub(now) })
+                            .to_string(),
+                        );
+                    } else if expired {
+                        env.say("cache expired, run `prism cache sync`");
+                    } else {
+                        let mut t = table(&["Field", "Value"]);
+                        t.add_row(["Passwords".to_string(), h.count.to_string()]);
+                        t.add_row(["Generated".to_string(), format!("{} ago", cache::fmt_duration(now.saturating_sub(h.generated_at)))]);
+                        t.add_row(["Expires in".to_string(), cache::fmt_duration(h.expires_at - now)]);
+                        env.say(t.to_string());
+                    }
+                }
+            }
+        }
+        CacheCmd::Clear => {
+            let existed = env.pw_cache()?.clear()?;
+            if json {
+                env.say(json!({ "cleared": existed }).to_string());
+            } else {
+                env.say(if existed { "Local password cache deleted." } else { "No local password cache." });
+            }
+        }
+        CacheCmd::Ttl { duration } => {
+            let secs = cache::parse_duration(&duration)?;
+            let mut c = env.connect().await?;
+            let mut s = c.get_settings().await?;
+            s.password_cache_secs = secs;
+            eprintln!("Confirm on your Prism...");
+            c.set_settings(s).await?;
+            if secs == 0 {
+                env.drop_cache();
+                env.say("Password caching is off; local cache deleted.");
+            } else {
+                env.say(format!("Password cache lifetime set to {}. Run `prism cache sync` to fill it.", cache::fmt_duration(secs as u64)));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_inner(cli: Cli, env: &Arc<Env>) -> Result<()> {
     let json = cli.json;
     match cli.cmd {
         Cmd::Pair => {
@@ -589,8 +922,14 @@ pub async fn run(cli: Cli, env: &Arc<Env>) -> Result<()> {
         Cmd::Ls { kind } => {
             let mut c = env.connect().await?;
             let list = c.list(kind.map(Into::into)).await?;
+            // Settings are readable without a tap; used only to resolve "default (…)".
+            let defaults = if list.iter().any(|s| s.policy == ApprovalPolicy::Default) {
+                c.get_settings().await.ok().map(|s| s.approvals)
+            } else {
+                None
+            };
             if json {
-                env.say(serde_json::Value::Array(list.iter().map(summary_json).collect()).to_string());
+                env.say(serde_json::Value::Array(list.iter().map(|s| summary_json(s, defaults.as_ref())).collect()).to_string());
             } else {
                 let mut t = table(&["ID", "Kind", "Title", "Detail", "Approval"]);
                 for s in &list {
@@ -599,15 +938,32 @@ pub async fn run(cli: Cli, env: &Arc<Env>) -> Result<()> {
                         format!("{:?}", s.kind),
                         s.title.clone(),
                         s.subtitle.clone(),
-                        format!("{:?}", s.policy),
+                        policy_label(s, defaults.as_ref()),
                     ]);
                 }
                 env.say(t.to_string());
             }
         }
-        Cmd::Show { entry, field, copy } => {
-            let mut c = env.connect().await?;
-            let list = c.list(None).await?;
+        Cmd::Show { entry, field, copy, offline } => {
+            if offline {
+                return show_from_cache(env, json, &entry, field, copy).await;
+            }
+            let (mut c, list) = match async {
+                let mut c = env.connect().await?;
+                let list = c.list(None).await?;
+                anyhow::Ok((c, list))
+            }
+            .await
+            {
+                Ok(x) => x,
+                Err(e) if is_offline_error(&e) => {
+                    return match show_from_cache(env, json, &entry, field, copy).await {
+                        Ok(()) => Ok(()),
+                        Err(ce) => Err(e.context(format!("device unreachable and local cache unusable: {ce:#}"))),
+                    };
+                }
+                Err(e) => return Err(e),
+            };
             let s = resolve(&list, &entry)?;
             if json && s.kind == EntryKind::RecoveryCodes && matches!(field, None | Some(FieldArg::RecoveryCodes)) {
                 // GetEntry carries the per-code `used` state.
@@ -621,6 +977,50 @@ pub async fn run(cli: Cli, env: &Arc<Env>) -> Result<()> {
             let v = c.get_secret(s.id, f, None).await?;
             output_secret(env, json, &format!("{f:?}"), secret_to_string(&v), copy).await?;
         }
+        Cmd::Approvals { cmd } => {
+            let mut c = env.connect().await?;
+            let mut s = c.get_settings().await?;
+            if let Some(ApprovalsCmd::Set { op, policy }) = cmd {
+                let p = match policy {
+                    DefaultPolicyArg::Always => ApprovalPolicy::Always,
+                    DefaultPolicyArg::Session => ApprovalPolicy::Session,
+                    DefaultPolicyArg::Never => ApprovalPolicy::Never,
+                };
+                if matches!(op, OpArg::Passkey) && p == ApprovalPolicy::Never {
+                    bail!("passkeys cannot be set to 'never': a passkey sign-in must always prove user presence. Use 'always' or 'session'.");
+                }
+                *op.slot(&mut s.approvals) = p;
+                eprintln!("Confirm on your Prism...");
+                c.set_settings(s.clone()).await?;
+            }
+            if json {
+                env.say(approvals_json(&s.approvals).to_string());
+            } else {
+                let mut t = table(&["Operation", "Policy", "Description"]);
+                for op in OpArg::ALL {
+                    t.add_row([op.name(), policy_word(s.approvals.get(op.op())), op.describe()]);
+                }
+                env.say(t.to_string());
+            }
+        }
+        Cmd::Policy { entry, policy } => {
+            let mut c = env.connect().await?;
+            let list = c.list(None).await?;
+            let s = resolve(&list, &entry)?;
+            let (id, title, kind) = (s.id, s.title.clone(), s.kind);
+            let p: ApprovalPolicy = policy.into();
+            if kind == EntryKind::Passkey && p == ApprovalPolicy::Never {
+                bail!("passkeys cannot be set to 'never': a passkey sign-in must always prove user presence.");
+            }
+            eprintln!("Confirm on your Prism...");
+            c.set_entry_policy(id, p).await?;
+            if json {
+                env.say(json!({ "id": id.to_hex(), "title": title, "policy": p }).to_string());
+            } else {
+                env.say(format!("'{title}' approval policy: {}.", policy_word(p)));
+            }
+        }
+        Cmd::Cache(cc) => run_cache(env, json, cc).await?,
         Cmd::Add(a) => {
             let entry = match a {
                 AddCmd::Password { title, username, url, notes, generate, length, print, policy } => {
@@ -855,18 +1255,18 @@ pub async fn run(cli: Cli, env: &Arc<Env>) -> Result<()> {
                     }
                 }
                 HostsCmd::Rm { host } => {
-                    let target = if let Ok(i) = host.parse::<usize>().map_err(|_| ()).and_then(|i| hosts.get(i).ok_or(())) {
-                        i
-                    } else {
-                        let m: Vec<_> = hosts.iter().filter(|h| hex::encode(h.public_key).starts_with(&host.to_lowercase())).collect();
-                        match m.len() {
-                            1 => m[0],
-                            0 => bail!("no paired host matching '{host}'"),
-                            _ => bail!("'{host}' matches several hosts"),
-                        }
-                    };
-                    c.remove_paired_host(target.public_key).await?;
+                    let target = find_host(&hosts, &host)?;
+                    let key = target.public_key;
+                    c.remove_paired_host(key).await?;
+                    if host_pubkey(&env.paths).is_ok_and(|me| me == key) {
+                        env.drop_cache();
+                    }
                     env.say(format!("Removed '{}'.", target.label));
+                }
+                HostsCmd::Rename { host, label } => {
+                    let target = find_host(&hosts, &host)?;
+                    c.rename_paired_host(target.public_key, &label).await?;
+                    env.say(format!("Renamed '{}' to '{}'.", target.label, label.trim()));
                 }
             }
         }

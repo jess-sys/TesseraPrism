@@ -66,6 +66,8 @@ pub enum TransportCommand {
     SetBondingAllowed(bool),
     /// Update the BLE Battery Service level (0..=100). Added by the transport agent.
     SetBattery(u8),
+    /// Locked standby: slow advertising interval (~1-1.5 s) so the radio mostly sleeps.
+    SetLowPower(bool),
     /// Disconnect everything and shut the radio down (before power-off).
     Shutdown,
 }
@@ -135,6 +137,11 @@ pub fn start(config: TransportConfig) -> anyhow::Result<TransportHandles> {
                 TransportCommand::SetBondingAllowed(on) => {
                     if let Some(b) = &ble {
                         b.set_bonding_allowed(on);
+                    }
+                }
+                TransportCommand::SetLowPower(on) => {
+                    if let Some(b) = &ble {
+                        b.set_low_power(on);
                     }
                 }
                 TransportCommand::SetBattery(level) => {

@@ -51,7 +51,18 @@ final class ModelsTests: XCTestCase {
     }
 
     func testSettings() throws {
-        try roundTrip(DeviceSettings(), #"{"auto_lock_secs":180,"sleep_mode":"PowerOff","keyboard_layout":"Us","orientation":"Portrait","buzzer":true,"owner_info":null}"#)
+        try roundTrip(DeviceSettings(), #"{"approvals":{"delete":"Always","modify":"Always","password":"Always","passkey":"Always","recovery_codes":"Always","ssh_sign":"Always","totp":"Always","type_over_usb":"Always"},"auto_lock_secs":180,"buzzer":true,"keyboard_layout":"Us","orientation":"Portrait","owner_info":null,"password_cache_secs":0,"sleep_mode":"PowerOff"}"#)
+        var s = DeviceSettings(passwordCacheSecs: 3600)
+        s.approvals[.password] = .never; s.approvals[.passkey] = .session
+        let back = try PrismJSON.decode(DeviceSettings.self, from: try PrismJSON.string(s))
+        XCTAssertEqual(back, s)
+        XCTAssertEqual(back.approvals.password, .never)
+    }
+
+    func testApprovalPolicyDefault() throws {
+        try roundTrip(ApprovalPolicy.default, #""Default""#)
+        try roundTrip(Request.setEntryPolicy(id: id, policy: .default), #"{"SetEntryPolicy":{"id":\#(idJSON),"policy":"Default"}}"#)
+        try roundTrip(Request.passwordSnapshot, #""PasswordSnapshot""#)
     }
 
     func testRequests() throws {
@@ -73,6 +84,8 @@ final class ModelsTests: XCTestCase {
         try roundTrip(Request.export(passphrase: "pw"), #"{"Export":{"passphrase":"pw"}}"#)
         try roundTrip(Request.setRecoveryPassphrase(passphrase: "pw"), #"{"SetRecoveryPassphrase":{"passphrase":"pw"}}"#)
         try roundTrip(Request.getEntry(id: id), #"{"GetEntry":{"id":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]}}"#)
+        try roundTrip(Request.listPasskeys, #""ListPasskeys""#)
+        try roundTrip(Request.renamePairedHost(publicKey: [1, 2], label: "Mac"), #"{"RenamePairedHost":{"public_key":[1,2],"label":"Mac"}}"#)
     }
 
     func testEnvelope() throws {

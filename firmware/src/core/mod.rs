@@ -17,7 +17,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use prism_core::model::{EntryId, PairedHost, Settings};
+use prism_core::model::{PairedHost, Settings};
 use prism_core::UnlockedVault;
 use prism_proto::{DeviceEvent, DeviceSession, Envelope, ErrorCode, ProtoError, Response};
 use prism_ui::{Counts, UiEvent};
@@ -125,9 +125,9 @@ pub struct Core {
     sessions: HashMap<Link, Session>,
     pairing_deadline: Option<Instant>,
     broker: Broker,
-    session_approved: HashSet<EntryId>,
+    session_approved: HashSet<approval::SessionKey>,
     import: Option<ImportBuf>,
-    export: Option<Vec<u8>>,
+    export: Option<Zeroizing<Vec<u8>>>,
     /// Client that started the in-flight export/import: only it may fetch/send chunks, and only
     /// its close (not any other channel's) discards the buffers.
     transfer_owner: Option<Link>,
@@ -266,7 +266,12 @@ impl Core {
     fn run(mut self) {
         self.boot();
         loop {
-            let mut wait = Duration::from_secs(1);
+            // Locked standby: wake rarely (light sleep); everything relevant arrives as a message.
+            let mut wait = if self.vault.is_none() && self.mode == Mode::LockScreen {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_secs(1)
+            };
             let now = Instant::now();
             let reminder = (!self.approval_reminded)
                 .then(|| self.broker.deadline().map(|d| d - APPROVAL_REMINDER_BEFORE))
@@ -312,6 +317,7 @@ impl Core {
         });
         self.power(PowerMsg::Settings(self.settings.clone()));
         crate::sound::set_enabled(self.settings.buzzer);
+        self.sound(crate::sound::Sound::PowerOn);
         if self.initialized && fails >= 3 {
             self.ui(UiEvent::ShowPin { attempts_left: Some(crate::storage::MAX_PIN_FAILS.saturating_sub(fails)) });
         } else {
@@ -508,6 +514,10 @@ impl Core {
             Ok(DeviceEvent::SendFrame(f)) => self.tx(TransportCommand::PrismFrame { link, frame: f }),
             Ok(DeviceEvent::Established { remote_static }) => self.on_established(link, remote_static),
             Ok(DeviceEvent::Request(env)) => self.on_session_request(link, env),
+            Ok(DeviceEvent::Unknown { id }) => {
+                log::warn!("{link:?}: request {id} not supported by this firmware");
+                self.reply(link, id, Response::Error(ErrorCode::Unsupported));
+            }
             Err(e) => {
                 log::warn!("{link:?}: bad frame: {e}");
                 if let Some(s) = self.sessions.remove(&link) {
@@ -570,6 +580,11 @@ impl Core {
     }
 
     pub(crate) fn reply(&mut self, link: Link, id: u32, body: Response) {
+        if matches!(body, Response::Error(ErrorCode::Locked)) && self.mode == Mode::LockScreen {
+            // A paired app needs the vault while we are in standby: wake to the PIN pad.
+            self.sound(crate::sound::Sound::Attention);
+            self.wake_if_lock_screen();
+        }
         let Some(s) = self.sessions.get_mut(&link) else {
             log::debug!("reply for closed {link:?} session dropped");
             return;

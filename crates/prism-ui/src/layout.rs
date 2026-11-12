@@ -170,13 +170,6 @@ pub fn pin_feedback_rect(sz: Size) -> Rectangle {
         rect(0, 150, sz.width, 160)
     }
 }
-pub fn approval_countdown_rect(sz: Size) -> Rectangle {
-    if land(sz) {
-        rect(500, 400, 440, 100)
-    } else {
-        rect(0, 616, sz.width, 56)
-    }
-}
 pub fn totp_segments(period: u32, remaining: u64) -> u32 {
     ((remaining * 10).div_ceil(period.max(1) as u64)).min(10) as u32
 }
@@ -687,7 +680,6 @@ impl Ui {
             ApprovalKind::RecoveryCodes => ("Recovery codes", Icon::Codes),
             ApprovalKind::Other => ("Approval request", Icon::Shield),
         };
-        let rem = a.deadline.saturating_sub(self.now);
         let cx = if l { 250 } else { w / 2 };
         let iw = if l { 440 } else { w - 48 };
         let (icy, ky, fy, ry, ey, et, cy0) = if l {
@@ -705,8 +697,6 @@ impl Ui {
         for (i, ln) in lines.iter().enumerate() {
             v.push(txt(ln.clone(), cx, cy0 + 20 + i as i32 * 34, F::Body, Align::Center, DIM));
         }
-        let cd = approval_countdown_rect(sz);
-        v.push(txt(format!("Auto-deny in {rem} s"), cd.top_left.x + cd.size.width as i32 / 2 + if l { 0 } else { 0 }, cd.top_left.y + 28, F::Body, Align::Center, INK));
         if l {
             v.push(Item::Btn(Btn::new(rect(500, 70, 436, 190), Id::Approve, "Approve", Style::Primary).font(F::Big)));
             v.push(Item::Btn(Btn::new(rect(500, 276, 436, 110), Id::Deny, "Deny", Style::Outline).font(F::Title)));
@@ -745,7 +735,7 @@ impl Ui {
         ));
         blocks.push(seg(
             "When locked",
-            vec![(Id::Sleep(SleepMode::PowerOff), "Power off", s.sleep_mode == SleepMode::PowerOff), (Id::Sleep(SleepMode::LightSleep), "Light sleep", s.sleep_mode == SleepMode::LightSleep)],
+            vec![(Id::Sleep(SleepMode::PowerOff), "Power off", s.sleep_mode == SleepMode::PowerOff), (Id::Sleep(SleepMode::LightSleep), "Stay reachable", s.sleep_mode == SleepMode::LightSleep)],
         ));
         blocks.push(seg(
             "Keyboard layout",

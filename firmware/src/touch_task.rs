@@ -12,8 +12,24 @@
 //! * a press within `BOUNCE` of the previous release is contact flicker: it is swallowed together
 //!   with its release.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::OnceLock;
+use std::thread::Thread;
 use std::time::{Duration, Instant};
+
+/// Touch polling is paused (and the controller asleep) on the lock screen: polling the I2C bus
+/// every 20 ms would keep the CPU out of light sleep in locked standby.
+static ACTIVE: AtomicBool = AtomicBool::new(true);
+static THREAD: OnceLock<Thread> = OnceLock::new();
+
+pub fn set_active(on: bool) {
+    if ACTIVE.swap(on, Ordering::SeqCst) != on {
+        if let Some(t) = THREAD.get() {
+            t.unpark();
+        }
+    }
+}
 
 use crate::core::msg::UiMsg;
 use crate::drivers::touch::Gt911;
@@ -31,12 +47,29 @@ const BOUNCE: Duration = Duration::from_millis(70);
 pub fn spawn(mut touch: Gt911, ui: Sender<UiMsg>) -> anyhow::Result<()> {
     // PSRAM stack is fine: I2C only, never touches flash.
     crate::threads::spawn_psram("touch", 6 * 1024, move || {
+        let _ = THREAD.set(std::thread::current());
+        let mut asleep = false;
         let mut last: Option<(u16, u16)> = None; // finger currently down (last position)
         let mut forwarded = false; // the current press was sent to the UI
         let mut empty = 0u32;
         let mut last_report = Instant::now();
         let mut released_at = Instant::now() - BOUNCE * 2;
         loop {
+            if !ACTIVE.load(Ordering::SeqCst) {
+                if !asleep {
+                    if let Err(e) = touch.sleep() {
+                        log::warn!("touch sleep: {e:#}");
+                    }
+                    asleep = true;
+                    last = None;
+                }
+                std::thread::park_timeout(Duration::from_secs(60));
+                continue;
+            }
+            if asleep {
+                touch.wake();
+                asleep = false;
+            }
             std::thread::sleep(POLL);
             let report = match touch.read_points() {
                 Ok(r) => r,

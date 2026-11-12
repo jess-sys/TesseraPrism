@@ -70,6 +70,17 @@ struct EntryListView: View {
     }
 }
 
+extension ApprovalPolicy {
+    /// Device defaults of `.default` mean "always"; passkeys never skip presence.
+    func normalized(for op: ApprovalOp) -> ApprovalPolicy {
+        switch (op, self) {
+        case (_, .default): return .always
+        case (.passkey, .never): return .session
+        default: return self
+        }
+    }
+}
+
 extension EntrySummary: Hashable {
     public func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
@@ -88,7 +99,7 @@ struct EntryDetailView: View {
                 LabeledContent("Title", value: summary.title)
                 if !summary.subtitle.isEmpty { LabeledContent("Account", value: summary.subtitle) }
                 if let url = summary.url { LabeledContent("Website", value: url) }
-                LabeledContent("Approval", value: summary.policy.rawValue)
+                approvalPicker
             }
             switch summary.kind {
             case .password:
@@ -129,6 +140,22 @@ struct EntryDetailView: View {
         }
     }
 
+    @ViewBuilder var approvalPicker: some View {
+        let op = summary.kind.approvalOp
+        let current = model.settings?.approvals[op].normalized(for: op) ?? .always
+        let binding = Binding<ApprovalPolicy>(get: { summary.policy }, set: { new in
+            guard new != summary.policy else { return }
+            Task { _ = await model.setEntryPolicy(summary.id, new) }
+        })
+        Picker("Approval", selection: binding) {
+            Text("Device default (\(current.label))").tag(ApprovalPolicy.default)
+            Text(ApprovalPolicy.always.label).tag(ApprovalPolicy.always)
+            Text(ApprovalPolicy.session.label).tag(ApprovalPolicy.session)
+            if summary.kind != .passkey { Text(ApprovalPolicy.never.label).tag(ApprovalPolicy.never) }
+        }
+        Text("Changing this asks for a tap on the Prism.").font(.caption).foregroundStyle(.secondary)
+    }
+
     @ViewBuilder var totpSection: some View {
         Section("One-time code") {
             if let totp {
@@ -155,7 +182,7 @@ struct AddEntryView: View {
     @State private var url = ""
     @State private var notes = ""
     @State private var otpauth = ""
-    @State private var policy: ApprovalPolicy = .always
+    @State private var policy: ApprovalPolicy = .default
     @State private var scanning = false
 
     var body: some View {
@@ -176,7 +203,12 @@ struct AddEntryView: View {
                     Button("Scan QR code") { scanning = true }
                     #endif
                 }
-                Picker("Approval", selection: $policy) { ForEach(ApprovalPolicy.allCases, id: \.self) { Text($0.rawValue).tag($0) } }
+                Picker("Approval", selection: $policy) {
+                    Text(ApprovalPolicy.default.label).tag(ApprovalPolicy.default)
+                    Text(ApprovalPolicy.always.label).tag(ApprovalPolicy.always)
+                    Text(ApprovalPolicy.session.label).tag(ApprovalPolicy.session)
+                    Text(ApprovalPolicy.never.label).tag(ApprovalPolicy.never)
+                }
             }
             .formStyle(.grouped)
             .navigationTitle("Add entry")

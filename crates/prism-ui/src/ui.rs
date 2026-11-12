@@ -547,23 +547,17 @@ impl Ui {
         if (unix + self.status.tz_secs as u64) / 60 != old_min {
             self.status_dirty();
         }
-        // Approval countdown / auto-deny
+        // Approval auto-deny. No visible countdown: redrawing it every few seconds kept the panel
+        // busy and made taps on Approve/Deny unreliable.
         let mut expired = None;
-        let mut countdown_dirty = false;
         if let Screen::Approval(a) = &self.screen {
-            let rem = a.deadline.saturating_sub(unix);
-            if rem == 0 {
+            if a.deadline.saturating_sub(unix) == 0 {
                 expired = Some(a.req.id);
-            } else if rem % 5 == 0 || rem <= 5 {
-                countdown_dirty = true;
             }
         }
         if let Some(id) = expired {
             out.push(UiAction::Deny(id));
             self.pop();
-        } else if countdown_dirty {
-            let r = approval_countdown_rect(self.size());
-            self.partial(r);
         }
         // TOTP boundaries
         let mut req = None;
@@ -677,8 +671,8 @@ impl Ui {
                         4 => out.push(UiAction::OpenList(EntryKind::RecoveryCodes)),
                         _ => self.push(Screen::Settings { page: 0 }),
                     },
-                    // Lock is a full shutdown (keys wiped, power cut).
-                    Id::LockNow => out.push(UiAction::PowerOff),
+                    // Lock: keys wiped, then standby or power-off per Settings.sleep_mode.
+                    Id::LockNow => out.push(UiAction::Lock),
                     _ => {}
                 }
                 return;

@@ -241,7 +241,11 @@ impl Store {
 
     pub fn settings(&self) -> Settings {
         self.get_blob(K_SETTINGS)
-            .and_then(|b| postcard::from_bytes::<Settings>(&b).ok())
+            .and_then(|b| {
+                postcard::from_bytes::<Settings>(&b)
+                    .ok()
+                    .or_else(|| postcard::from_bytes::<prism_core::model::SettingsV1>(&b).ok().map(Settings::from))
+            })
             .unwrap_or_default()
     }
 

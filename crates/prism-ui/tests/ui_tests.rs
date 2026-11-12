@@ -634,7 +634,7 @@ fn lock_and_zeroize() {
     ui.handle(UiEvent::Unlocked(counts()));
     assert!(!ui.targets().iter().any(|t| t.0 == "PowerOff"));
     let a = tap(&mut ui, "LockNow");
-    assert!(a.iter().any(|a| matches!(a, UiAction::PowerOff)));
+    assert!(a.iter().any(|a| matches!(a, UiAction::Lock)));
 }
 
 #[test]

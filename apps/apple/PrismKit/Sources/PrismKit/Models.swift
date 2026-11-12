@@ -116,7 +116,62 @@ public struct EntryId: Codable, Hashable, Sendable {
 public enum EntryKind: String, SerdeUnitEnum, CaseIterable {
     case password = "Password", totp = "Totp", passkey = "Passkey", sshKey = "SshKey", recoveryCodes = "RecoveryCodes"
 }
-public enum ApprovalPolicy: String, SerdeUnitEnum, CaseIterable { case always = "Always", session = "Session", never = "Never" }
+public enum ApprovalPolicy: String, SerdeUnitEnum, CaseIterable {
+    case always = "Always", session = "Session", never = "Never"
+    /// Follow the device-wide default for the operation (`DeviceSettings.approvals`).
+    case `default` = "Default"
+}
+public enum ApprovalOp: String, SerdeUnitEnum, CaseIterable {
+    case password = "Password", totp = "Totp", sshSign = "SshSign", passkey = "Passkey"
+    case recoveryCodes = "RecoveryCodes", typeOverUsb = "TypeOverUsb", modify = "Modify", delete = "Delete"
+}
+
+public struct ApprovalDefaults: Codable, Equatable, Sendable {
+    public var password: ApprovalPolicy
+    public var totp: ApprovalPolicy
+    public var sshSign: ApprovalPolicy
+    public var passkey: ApprovalPolicy
+    public var recoveryCodes: ApprovalPolicy
+    public var typeOverUsb: ApprovalPolicy
+    public var modify: ApprovalPolicy
+    public var delete: ApprovalPolicy
+    enum CodingKeys: String, CodingKey {
+        case password, totp, sshSign = "ssh_sign", passkey, recoveryCodes = "recovery_codes"
+        case typeOverUsb = "type_over_usb", modify, delete
+    }
+    public init(password: ApprovalPolicy = .always, totp: ApprovalPolicy = .always, sshSign: ApprovalPolicy = .always,
+                passkey: ApprovalPolicy = .always, recoveryCodes: ApprovalPolicy = .always,
+                typeOverUsb: ApprovalPolicy = .always, modify: ApprovalPolicy = .always, delete: ApprovalPolicy = .always) {
+        self.password = password; self.totp = totp; self.sshSign = sshSign; self.passkey = passkey
+        self.recoveryCodes = recoveryCodes; self.typeOverUsb = typeOverUsb; self.modify = modify; self.delete = delete
+    }
+    public subscript(op: ApprovalOp) -> ApprovalPolicy {
+        get {
+            switch op {
+            case .password: return password
+            case .totp: return totp
+            case .sshSign: return sshSign
+            case .passkey: return passkey
+            case .recoveryCodes: return recoveryCodes
+            case .typeOverUsb: return typeOverUsb
+            case .modify: return modify
+            case .delete: return delete
+            }
+        }
+        set {
+            switch op {
+            case .password: password = newValue
+            case .totp: totp = newValue
+            case .sshSign: sshSign = newValue
+            case .passkey: passkey = newValue
+            case .recoveryCodes: recoveryCodes = newValue
+            case .typeOverUsb: typeOverUsb = newValue
+            case .modify: modify = newValue
+            case .delete: delete = newValue
+            }
+        }
+    }
+}
 public enum TotpAlgorithm: String, SerdeUnitEnum { case sha1 = "Sha1", sha256 = "Sha256", sha512 = "Sha512" }
 public enum CoseAlg: String, SerdeUnitEnum { case es256 = "Es256", edDsa = "EdDsa" }
 public enum SecretField: String, SerdeUnitEnum {
@@ -267,12 +322,26 @@ public struct Entry: Codable, Equatable, Sendable {
     public var policy: ApprovalPolicy
     public var data: EntryData
     public init(id: EntryId, title: String, tags: [String] = [], created: UInt64, modified: UInt64,
-                policy: ApprovalPolicy = .always, data: EntryData) {
+                policy: ApprovalPolicy = .default, data: EntryData) {
         self.id = id; self.title = title; self.tags = tags; self.created = created
         self.modified = modified; self.policy = policy; self.data = data
     }
     public static func randomId() -> EntryId {
         EntryId(bytes: (0..<16).map { _ in UInt8.random(in: 0...255) })
+    }
+}
+
+/// Public identifiers of a passkey stored on the device (no key material), used to register it
+/// with the system credential store so browsers know the Prism can answer for the site.
+public struct PasskeyIdentity: Codable, Equatable, Sendable {
+    public var id: EntryId
+    public var rpId: String
+    public var userName: String
+    public var userHandle: [UInt8]
+    public var credentialId: [UInt8]
+    enum CodingKeys: String, CodingKey { case id, rpId = "rp_id", userName = "user_name", userHandle = "user_handle", credentialId = "credential_id" }
+    public init(id: EntryId, rpId: String, userName: String, userHandle: [UInt8], credentialId: [UInt8]) {
+        self.id = id; self.rpId = rpId; self.userName = userName; self.userHandle = userHandle; self.credentialId = credentialId
     }
 }
 
@@ -346,12 +415,17 @@ public struct DeviceSettings: Codable, Equatable, Sendable {
     public var orientation: Orientation
     public var buzzer: Bool
     public var ownerInfo: String?
+    public var approvals: ApprovalDefaults
+    /// Validity of the companion password cache in seconds; 0 = disabled.
+    public var passwordCacheSecs: UInt32
     enum CodingKeys: String, CodingKey {
         case autoLockSecs = "auto_lock_secs", sleepMode = "sleep_mode", keyboardLayout = "keyboard_layout"
-        case orientation, buzzer, ownerInfo = "owner_info"
+        case orientation, buzzer, ownerInfo = "owner_info", approvals, passwordCacheSecs = "password_cache_secs"
     }
     public init(autoLockSecs: UInt32 = 180, sleepMode: SleepMode = .powerOff, keyboardLayout: KeyboardLayout = .us,
-                orientation: Orientation = .portrait, buzzer: Bool = true, ownerInfo: String? = nil) {
+                orientation: Orientation = .portrait, buzzer: Bool = true, ownerInfo: String? = nil,
+                approvals: ApprovalDefaults = ApprovalDefaults(), passwordCacheSecs: UInt32 = 0) {
+        self.approvals = approvals; self.passwordCacheSecs = passwordCacheSecs
         self.autoLockSecs = autoLockSecs; self.sleepMode = sleepMode; self.keyboardLayout = keyboardLayout
         self.orientation = orientation; self.buzzer = buzzer; self.ownerInfo = ownerInfo
     }
@@ -360,6 +434,7 @@ public struct DeviceSettings: Codable, Equatable, Sendable {
         try c.encode(autoLockSecs, forKey: .autoLockSecs); try c.encode(sleepMode, forKey: .sleepMode)
         try c.encode(keyboardLayout, forKey: .keyboardLayout); try c.encode(orientation, forKey: .orientation)
         try c.encode(buzzer, forKey: .buzzer); try c.encode(ownerInfo, forKey: .ownerInfo)
+        try c.encode(approvals, forKey: .approvals); try c.encode(passwordCacheSecs, forKey: .passwordCacheSecs)
     }
 }
 
@@ -409,14 +484,18 @@ public enum Request: Codable, Equatable, Sendable {
     case export(passphrase: String)
     case setRecoveryPassphrase(passphrase: String)
     case getEntry(id: EntryId)
+    case listPasskeys
     case exportChunk(offset: UInt32)
     case importBegin(totalLen: UInt32)
     case importChunk(offset: UInt32, data: [UInt8])
     case importCommit(passphrase: String, mode: ImportMode)
     case listPairedHosts
     case removePairedHost(publicKey: [UInt8])
+    case renamePairedHost(publicKey: [UInt8], label: String)
     case getSettings
     case setSettings(settings: DeviceSettings)
+    case setEntryPolicy(id: EntryId, policy: ApprovalPolicy)
+    case passwordSnapshot
 
     public init(from decoder: Decoder) throws {
         switch try Tagged.read(decoder) {
@@ -427,6 +506,8 @@ public enum Request: Codable, Equatable, Sendable {
             case "SshListKeys": self = .sshListKeys
             case "ListPairedHosts": self = .listPairedHosts
             case "GetSettings": self = .getSettings
+            case "ListPasskeys": self = .listPasskeys
+            case "PasswordSnapshot": self = .passwordSnapshot
             default: throw unknownVariant(t, "Request")
             }
         case .data(let t, let c):
@@ -454,7 +535,9 @@ public enum Request: Codable, Equatable, Sendable {
             case "ImportChunk": self = .importChunk(offset: try n.decode(UInt32.self, forKey: k("offset")), data: try n.decode([UInt8].self, forKey: k("data")))
             case "ImportCommit": self = .importCommit(passphrase: try n.decode(String.self, forKey: k("passphrase")), mode: try n.decode(ImportMode.self, forKey: k("mode")))
             case "RemovePairedHost": self = .removePairedHost(publicKey: try n.decode([UInt8].self, forKey: k("public_key")))
+            case "RenamePairedHost": self = .renamePairedHost(publicKey: try n.decode([UInt8].self, forKey: k("public_key")), label: try n.decode(String.self, forKey: k("label")))
             case "SetSettings": self = .setSettings(settings: try n.decode(DeviceSettings.self, forKey: k("settings")))
+            case "SetEntryPolicy": self = .setEntryPolicy(id: try n.decode(EntryId.self, forKey: k("id")), policy: try n.decode(ApprovalPolicy.self, forKey: k("policy")))
             default: throw unknownVariant(t, "Request")
             }
         }
@@ -474,6 +557,8 @@ public enum Request: Codable, Equatable, Sendable {
         case .sshListKeys: try unit("SshListKeys")
         case .listPairedHosts: try unit("ListPairedHosts")
         case .getSettings: try unit("GetSettings")
+        case .listPasskeys: try unit("ListPasskeys")
+        case .passwordSnapshot: try unit("PasswordSnapshot")
         case .setTime(let u): try variant("SetTime") { try $0.encode(u, forKey: k("unix")) }
         case .unlock(let p): try variant("Unlock") { try $0.encode(p, forKey: k("passphrase")) }
         case .listEntries(let kind): try variant("ListEntries") { try $0.encode(kind, forKey: k("kind")) }
@@ -501,7 +586,9 @@ public enum Request: Codable, Equatable, Sendable {
         case .importChunk(let o, let d): try variant("ImportChunk") { try $0.encode(o, forKey: k("offset")); try $0.encode(d, forKey: k("data")) }
         case .importCommit(let p, let m): try variant("ImportCommit") { try $0.encode(p, forKey: k("passphrase")); try $0.encode(m, forKey: k("mode")) }
         case .removePairedHost(let pk): try variant("RemovePairedHost") { try $0.encode(pk, forKey: k("public_key")) }
+        case .renamePairedHost(let pk, let l): try variant("RenamePairedHost") { try $0.encode(pk, forKey: k("public_key")); try $0.encode(l, forKey: k("label")) }
         case .setSettings(let s): try variant("SetSettings") { try $0.encode(s, forKey: k("settings")) }
+        case .setEntryPolicy(let id, let p): try variant("SetEntryPolicy") { try $0.encode(id, forKey: k("id")); try $0.encode(p, forKey: k("policy")) }
         }
     }
 }
@@ -524,6 +611,7 @@ public enum Response: Codable, Equatable, Sendable {
     case chunk(offset: UInt32, data: [UInt8])
     case pairedHosts([PairedHost])
     case settings(DeviceSettings)
+    case passkeys([PasskeyIdentity])
     case error(ErrorCode)
 
     public init(from decoder: Decoder) throws {
@@ -552,6 +640,7 @@ public enum Response: Codable, Equatable, Sendable {
                 self = .chunk(offset: try n.decode(UInt32.self, forKey: AnyKey("offset")), data: try n.decode([UInt8].self, forKey: AnyKey("data")))
             case "PairedHosts": self = .pairedHosts(try c.decode([PairedHost].self, forKey: k))
             case "Settings": self = .settings(try c.decode(DeviceSettings.self, forKey: k))
+            case "Passkeys": self = .passkeys(try c.decode([PasskeyIdentity].self, forKey: k))
             case "Error": self = .error(try c.decode(ErrorCode.self, forKey: k))
             default: throw unknownVariant(t, "Response")
             }
@@ -584,6 +673,7 @@ public enum Response: Codable, Equatable, Sendable {
             try n.encode(o, forKey: k("offset")); try n.encode(d, forKey: k("data"))
         case .pairedHosts(let v): try c.encode(v, forKey: k("PairedHosts"))
         case .settings(let v): try c.encode(v, forKey: k("Settings"))
+        case .passkeys(let v): try c.encode(v, forKey: k("Passkeys"))
         case .error(let v): try c.encode(v, forKey: k("Error"))
         }
     }

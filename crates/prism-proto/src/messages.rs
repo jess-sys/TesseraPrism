@@ -22,7 +22,7 @@
 
 use prism_core::model::{
     ApprovalPolicy, DeviceInfo, Entry, EntryId, EntryKind, EntrySummary, ImportMode,
-    KeyboardLayout, PairedHost, SecretField, SecretValue, Settings, SshPublicKey,
+    KeyboardLayout, PairedHost, PasskeyIdentity, SecretField, SecretValue, Settings, SshPublicKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -122,6 +122,22 @@ pub enum Request {
     GetEntry {
         id: EntryId,
     },
+    /// Public identifiers of all passkeys (no approval needed). → `Passkeys`
+    ListPasskeys,
+    /// Change a paired host's display label (device asks for a tap). → `Ok`
+    RenamePairedHost {
+        public_key: [u8; 32],
+        label: String,
+    },
+    /// Change one entry's approval policy (device asks for a tap). → `Ok`
+    SetEntryPolicy {
+        id: EntryId,
+        policy: ApprovalPolicy,
+    },
+    /// All passwords for the host's encrypted local cache (device always asks for a tap;
+    /// `Unsupported` when `Settings::password_cache_secs` is 0). → `ExportReady`, then read
+    /// with `ExportChunk`; the bytes are a postcard `PasswordSnapshot`.
+    PasswordSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +158,7 @@ pub enum Response {
     Settings(Settings),
     Error(ErrorCode),
     Entry(Entry),
+    Passkeys(Vec<PasskeyIdentity>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -66,10 +66,14 @@ enum Out {
     RejectPairing,
     /// Re-evaluate advertising state.
     Advertising,
+    /// Re-apply advertising parameters (interval) and restart advertising.
+    Reconfigure,
     Shutdown(Sender<()>),
 }
 
 struct Shared {
+    /// Locked standby: slow advertising.
+    low_power: AtomicBool,
     events: Sender<TransportEvent>,
     out: Sender<Out>,
     conns: Mutex<HashMap<u16, Conn>>,
@@ -125,6 +129,7 @@ impl Ble {
     pub fn start(config: &TransportConfig, events: Sender<TransportEvent>) -> anyhow::Result<Ble> {
         let (out_tx, out_rx) = mpsc::channel::<Out>();
         let shared = Arc::new(Shared {
+            low_power: AtomicBool::new(false),
             events,
             out: out_tx,
             conns: Mutex::new(HashMap::new()),
@@ -403,6 +408,12 @@ impl Ble {
         let _ = self.shared.out.send(Out::Advertising);
     }
 
+    pub fn set_low_power(&self, on: bool) {
+        if self.shared.low_power.swap(on, Ordering::SeqCst) != on {
+            let _ = self.shared.out.send(Out::Reconfigure);
+        }
+    }
+
     pub fn set_bonding_allowed(&self, on: bool) {
         self.shared.bonding_allowed.store(on, Ordering::SeqCst);
     }
@@ -420,6 +431,69 @@ impl Ble {
             let _ = rx.recv_timeout(Duration::from_secs(3));
         }
     }
+}
+
+/// Value handle of the Prism TX characteristic, looked up once the GATT server is running.
+fn prism_tx_value_handle() -> u16 {
+    static HANDLE: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let h = HANDLE.load(Ordering::Relaxed);
+    if h != 0 {
+        return h;
+    }
+    let svc: sys::ble_uuid_any_t = uuid128(PRISM_SERVICE).into();
+    let chr: sys::ble_uuid_any_t = uuid128(PRISM_TX).into();
+    let mut val = 0u16;
+    let rc = unsafe { sys::ble_gatts_find_chr(&svc.u, &chr.u, std::ptr::null_mut(), &mut val) };
+    if rc == 0 {
+        HANDLE.store(val, Ordering::Relaxed);
+    }
+    val
+}
+
+/// Notify a Prism frame chunk to `handle`. The library only notifies connections in its own
+/// subscription list, which can miss a client: on macOS several processes share one link, and
+/// when one leaves, the CCCD is cleared, while the next one's "enable" may not be written again
+/// on that still-open link. CoreBluetooth only delivers notifications to processes that asked
+/// for them, so sending to the requesting connection regardless is safe.
+fn notify_prism(chr: &Chr, handle: u16, data: &[u8]) -> bool {
+    // Normal path first; EINVAL means "not in the library's subscription list".
+    for _ in 0..200 {
+        match chr.lock().notify_with(data, handle) {
+            Ok(()) => return true,
+            Err(e) if e.code() == sys::BLE_HS_ENOMEM || e.code() == sys::BLE_HS_EBUSY => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) if e.code() == sys::BLE_HS_EINVAL => break,
+            Err(e) => {
+                log::warn!("ble: notify to {handle} failed: {e:?}");
+                return false;
+            }
+        }
+    }
+    log::info!("ble: conn {handle} not subscribed per stack bookkeeping; notifying directly");
+    let val = prism_tx_value_handle();
+    if val == 0 {
+        log::warn!("ble: prism TX handle unknown, frame dropped");
+        return false;
+    }
+    for _ in 0..200 {
+        let om = unsafe { sys::ble_hs_mbuf_from_flat(data.as_ptr().cast(), data.len() as u16) };
+        if om.is_null() {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        let rc = unsafe { sys::ble_gatts_notify_custom(handle, val, om) } as u32;
+        match rc {
+            0 => return true,
+            sys::BLE_HS_ENOMEM | sys::BLE_HS_EBUSY => thread::sleep(Duration::from_millis(5)),
+            _ => {
+                log::warn!("ble: raw notify to {handle} failed: rc={rc}");
+                return false;
+            }
+        }
+    }
+    log::warn!("ble: raw notify to {handle} timed out");
+    false
 }
 
 fn notify(chr: &Chr, handle: u16, data: &[u8]) -> bool {
@@ -450,7 +524,7 @@ fn worker(sh: Arc<Shared>, rx: mpsc::Receiver<Out>, prism_tx: Chr, fido_status: 
                     log::warn!("ble: prism frame for closed connection {h} dropped");
                 } else {
                     for c in prism_ble::chunk_for(&frame, att_mtu(h), chan) {
-                        if !notify(&prism_tx, h, &c) {
+                        if !notify_prism(&prism_tx, h, &c) {
                             break;
                         }
                     }
@@ -475,6 +549,21 @@ fn worker(sh: Arc<Shared>, rx: mpsc::Receiver<Out>, prism_tx: Chr, fido_status: 
                 }
             }
             Ok(Out::Advertising) => apply_advertising(&sh),
+            Ok(Out::Reconfigure) => {
+                let low = sh.low_power.load(Ordering::SeqCst);
+                {
+                    let adv = BLEDevice::take().get_advertising();
+                    let mut adv = adv.lock();
+                    if adv.is_advertising() {
+                        let _ = adv.stop();
+                    }
+                    // Units of 0.625 ms: standby 1.0-1.5 s, normal 100-200 ms.
+                    let (min, max) = if low { (1600, 2400) } else { (160, 320) };
+                    adv.min_interval(min).max_interval(max);
+                }
+                log::info!("ble: advertising {}", if low { "low power (1-1.5 s)" } else { "normal" });
+                apply_advertising(&sh);
+            }
             Ok(Out::Shutdown(done)) => {
                 sh.shut_down.store(true, Ordering::SeqCst);
                 apply_advertising(&sh);

@@ -2119,6 +2119,7 @@ dependencies = [
  "arboard",
  "async-trait",
  "base64",
+ "chacha20poly1305",
  "clap",
  "comfy-table",
  "dirs",
@@ -2126,6 +2127,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "keyring",
  "prism-client",
  "prism-core",
  "prism-proto",
@@ -2137,6 +2139,7 @@ dependencies = [
  "ssh-key",
  "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -2149,6 +2152,7 @@ dependencies = [
  "futures",
  "hex",
  "keyring",
+ "postcard",
  "prism-client",
  "prism-core",
  "prism-proto",
@@ -2203,12 +2207,14 @@ dependencies = [
 name = "prism-ffi"
 version = "0.1.0"
 dependencies = [
+ "postcard",
  "prism-core",
  "prism-proto",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]

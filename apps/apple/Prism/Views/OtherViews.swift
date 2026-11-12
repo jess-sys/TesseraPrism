@@ -9,7 +9,7 @@ struct SSHKeysView: View {
     @State private var showGenerate = false
     @State private var name = ""
     @State private var comment = ""
-    @State private var policy: ApprovalPolicy = .always
+    @State private var policy: ApprovalPolicy = .default
 
     var body: some View {
         NavigationStack {
@@ -27,7 +27,9 @@ struct SSHKeysView: View {
                     Form {
                         TextField("Name", text: $name)
                         TextField("Comment (user@host)", text: $comment)
-                        Picker("Approval", selection: $policy) { ForEach(ApprovalPolicy.allCases, id: \.self) { Text($0.rawValue).tag($0) } }
+                        Picker("Approval", selection: $policy) {
+                            ForEach(ApprovalPolicy.allCases, id: \.self) { Text($0.label).tag($0) }
+                        }
                         Text("The Ed25519 key is derived on the device and never leaves it.").font(.footnote).foregroundStyle(.secondary)
                     }
                     .formStyle(.grouped)
@@ -133,6 +135,8 @@ struct SettingsView: View {
     @State private var settingRecovery = false
     @State private var rp1 = ""
     @State private var rp2 = ""
+    @State private var renaming: PairedHost?
+    @State private var newLabel = ""
 
     var body: some View {
         Form {
@@ -154,6 +158,36 @@ struct SettingsView: View {
                     Toggle("Buzzer", isOn: $draft.buzzer)
                     Button("Save settings") { Task { await model.save(draft) } }
                 }
+                Section {
+                    ForEach(ApprovalOp.allCases, id: \.self) { op in
+                        Picker(op.label, selection: Binding(get: { draft.approvals[op].normalized(for: op) }, set: { draft.approvals[op] = $0 })) {
+                            ForEach(op.choices, id: \.self) { Text($0.label).tag($0) }
+                        }
+                    }
+                    Button("Save settings") { Task { await model.save(draft) } }
+                } header: { Text("Approvals") } footer: {
+                    Text("When the Prism asks for a tap, per operation. Entries set to \"Device default\" follow these. Export, import, settings and host changes always ask.")
+                }
+                Section {
+                    Picker("Keep passwords on this device", selection: Binding(
+                        get: { PasswordCacheDuration(rawValue: draft.passwordCacheSecs) ?? .off },
+                        set: { draft.passwordCacheSecs = $0.rawValue })) {
+                        ForEach(PasswordCacheDuration.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    if let m = model.cacheMeta {
+                        LabeledContent("Status") {
+                            Text("\(m.count) passwords, expires \(m.expiryDate.formatted(.relative(presentation: .named)))")
+                        }
+                    } else {
+                        LabeledContent("Status", value: "No cached passwords")
+                    }
+                    Button("Save settings") { Task { await model.save(draft) } }
+                    Button("Sync now (approve on device)") { Task { if draft != model.settings { await model.save(draft) }; await model.syncCache() } }
+                        .disabled(draft.passwordCacheSecs == 0)
+                    Button("Delete local cache", role: .destructive) { model.clearCache() }.disabled(model.cacheMeta == nil)
+                } header: { Text("Password cache") } footer: {
+                    Text("Passwords are encrypted on this Mac or iPhone. AutoFill can fill them without the Prism after Touch ID, Face ID or your passcode, until the cache expires.")
+                }
                 Section("Recovery") {
                     Button("Set recovery passphrase...") { rp1 = ""; rp2 = ""; settingRecovery = true }
                 }
@@ -162,6 +196,8 @@ struct SettingsView: View {
                         HStack {
                             VStack(alignment: .leading) { Text(h.label); Text(h.publicKey.prefix(4).map { String(format: "%02x", $0) }.joined()).font(.caption.monospaced()).foregroundStyle(.secondary) }
                             Spacer()
+                            Button { newLabel = h.label; renaming = h } label: { Label("Rename", systemImage: "pencil") }
+                                .labelStyle(.iconOnly).buttonStyle(.borderless).help("Rename")
                             Button("Remove", role: .destructive) { Task { await model.removeHost(h) } }.buttonStyle(.borderless)
                         }
                     }
@@ -184,8 +220,19 @@ struct SettingsView: View {
             }
             Button("Cancel", role: .cancel) { rp1 = ""; rp2 = "" }
         } message: { Text("Used to encrypt exports. Confirm on your Prism.") }
+        .alert("Rename host", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+            TextField("Name", text: $newLabel)
+            Button("Rename") {
+                guard let h = renaming else { return }
+                let label = newLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+                renaming = nil
+                guard !label.isEmpty, label != h.label else { return }
+                Task { await model.renameHost(h, to: label) }
+            }
+            Button("Cancel", role: .cancel) { renaming = nil }
+        } message: { Text("Up to 32 characters. Confirm on your Prism.") }
         .navigationTitle("Settings")
-        .task { await model.loadSettings(); if let s = model.settings { draft = s } }
+        .task { model.refreshCacheState(); await model.loadSettings(); if let s = model.settings { draft = s } }
     }
 }
 
@@ -228,3 +275,45 @@ struct MenuBarView: View {
     }
 }
 #endif
+
+// MARK: - Cached passwords (Prism not connected)
+
+struct CachedPasswordsView: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var shown: (id: EntryId, password: String)?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let m = model.cacheMeta {
+                    Section {
+                        ForEach(m.entries) { e in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(e.title)
+                                Text(e.username).font(.caption).foregroundStyle(.secondary)
+                                HStack {
+                                    Button("Copy password") { Task { if let p = await model.cachedPassword(id: e.id, title: e.title) { Clipboard.copy(p) } } }
+                                    Button("Copy username") { Clipboard.copy(e.username) }
+                                    Button("Reveal") { Task { if let p = await model.cachedPassword(id: e.id, title: e.title) { shown = (e.id, p) } } }
+                                }.buttonStyle(.borderless).font(.caption)
+                                if let shown, shown.id == e.id {
+                                    Text(shown.password).font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                                }
+                            }
+                        }
+                    } footer: {
+                        Text("From local cache. Expires \(m.expiryDate.formatted(.relative(presentation: .named))).")
+                    }
+                } else {
+                    ContentUnavailableView("No cached passwords", systemImage: "lock.slash")
+                }
+            }
+            .navigationTitle("Cached passwords")
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+        #if os(macOS)
+        .frame(minWidth: 420, minHeight: 360)
+        #endif
+    }
+}

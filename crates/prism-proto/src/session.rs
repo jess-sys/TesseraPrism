@@ -134,12 +134,17 @@ impl Core {
     }
 
     fn decrypt<T: serde::de::DeserializeOwned>(&mut self, payload: &[u8]) -> Result<T> {
+        Ok(postcard::from_bytes(&self.decrypt_raw(payload)?)?)
+    }
+
+    fn decrypt_raw(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         let State::Transport(t) = &mut self.state else {
             return Err(Error::State("not established"));
         };
         let mut out = vec![0u8; payload.len()];
         let n = t.read_message(payload, &mut out)?;
-        Ok(postcard::from_bytes(&out[..n])?)
+        out.truncate(n);
+        Ok(out)
     }
 }
 
@@ -226,6 +231,9 @@ pub enum DeviceEvent {
     SendFrame(Vec<u8>),
     Established { remote_static: [u8; 32] },
     Request(Envelope<Request>),
+    /// A well-encrypted request this firmware cannot decode (e.g. a variant added by a newer
+    /// companion). The session is still in sync: answer `Error(Unsupported)` to `id`.
+    Unknown { id: u32 },
 }
 
 /// Responder side (firmware).
@@ -260,7 +268,17 @@ impl DeviceSession {
                     Ok(DeviceEvent::SendFrame(out))
                 }
             }
-            FrameKind::Transport => Ok(DeviceEvent::Request(self.core.decrypt(payload)?)),
+            FrameKind::Transport => {
+                let plain = self.core.decrypt_raw(payload)?;
+                match postcard::from_bytes::<Envelope<Request>>(&plain) {
+                    Ok(env) => Ok(DeviceEvent::Request(env)),
+                    // Envelope is `{ id: u32, body }`, so the id is the leading varint.
+                    Err(e) => match postcard::take_from_bytes::<u32>(&plain) {
+                        Ok((id, _)) => Ok(DeviceEvent::Unknown { id }),
+                        Err(_) => Err(e.into()),
+                    },
+                }
+            }
         }
     }
 
@@ -308,6 +326,26 @@ mod tests {
         };
         assert_eq!(remote_static, hp);
         (h, d, hp, dp)
+    }
+
+    #[test]
+    fn unknown_request_variant_keeps_session_and_reports_id() {
+        let (mut h, mut d, _, _) = pair();
+        // What a newer companion would send: envelope id 42, request variant index 200.
+        #[derive(serde::Serialize)]
+        struct Future {
+            id: u32,
+            variant: u32,
+        }
+        let f = h.core.encrypt(&Future { id: 42, variant: 200 }).unwrap();
+        assert!(matches!(d.on_frame(&f).unwrap(), DeviceEvent::Unknown { id: 42 }));
+        // The session is still in sync for the next request.
+        let f = h.encrypt_request(&Envelope { id: 43, body: Request::GetInfo }).unwrap();
+        let DeviceEvent::Request(env) = d.on_frame(&f).unwrap() else { panic!() };
+        assert_eq!(env.id, 43);
+        let r = d.encrypt_response(&Envelope { id: 42, body: Response::Error(ErrorCode::Unsupported) }).unwrap();
+        let SessionEvent::Response(env) = h.on_frame(&r).unwrap() else { panic!() };
+        assert_eq!(env.body, Response::Error(ErrorCode::Unsupported));
     }
 
     #[test]

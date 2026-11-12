@@ -22,16 +22,18 @@ struct RootView: View {
 struct BusyBanner: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
-        if let msg = model.busy {
-            HStack(spacing: 12) {
-                ProgressView()
-                Text(msg).font(.callout.weight(.medium))
+        Group {
+            if let activity = model.activity {
+                PrismActivityView(activity)
+                    .frame(maxWidth: 320)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                    .shadow(color: .black.opacity(0.15), radius: 16, y: 6)
+                    .padding(.bottom, 24)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            .padding(14)
-            .background(.regularMaterial, in: Capsule())
-            .padding(.bottom, 24)
-            .transition(.move(edge: .bottom).combined(with: .opacity))
         }
+        .animation(.smooth, value: model.activity)
     }
 }
 
@@ -50,30 +52,24 @@ struct MainTabs: View {
 
 struct ConnectView: View {
     @EnvironmentObject var model: AppModel
+    @State private var showCache = false
 
     var body: some View {
         VStack(spacing: 24) {
-            Image(systemName: "key.radiowaves.forward").font(.system(size: 64)).foregroundStyle(.tint)
-            Text("Prism").font(.largeTitle.bold())
+            PrismBrandHeader(logoSize: 88, subtitle: model.state == .disconnected ? "Your offline vault" : nil)
+                .padding(.bottom, 4)
             switch model.state {
             case .pairing(let sas):
-                VStack(spacing: 12) {
-                    Text("Pairing code").font(.headline)
-                    Text(sas).font(.system(size: 48, weight: .bold, design: .monospaced)).kerning(6)
-                    Text("Check that the same code is shown on your Prism, then tap Confirm on the device.")
-                        .multilineTextAlignment(.center).foregroundStyle(.secondary)
-                    ProgressView()
-                }
+                PrismActivityView(.pairing(code: sas))
             case .connecting:
                 VStack(spacing: 12) {
-                    ProgressView()
-                    Text("Looking for your Prism...").foregroundStyle(.secondary)
+                    PrismActivityView(.searching)
                     if !model.isPaired {
                         Text("On the device: Settings > Pair new host.").font(.footnote).foregroundStyle(.secondary)
                     }
                 }
             case .failed(let msg):
-                Text(msg).foregroundStyle(.red).multilineTextAlignment(.center)
+                PrismActivityView(.failure(msg))
                 connectButton
             default:
                 if let name = model.deviceName { Text("Last device: \(name)").foregroundStyle(.secondary) }
@@ -83,6 +79,10 @@ struct ConnectView: View {
                         .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 }
             }
+            if let m = model.cacheMeta {
+                Button { showCache = true } label: { Label("Cached passwords (\(m.count))", systemImage: "lock.doc") }
+                    .buttonStyle(.bordered)
+            }
             if model.usingStub {
                 Text("Running with the insecure StubCore (PrismFFI.xcframework not linked).")
                     .font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center)
@@ -90,6 +90,8 @@ struct ConnectView: View {
         }
         .padding(32)
         .frame(maxWidth: 480)
+        .onAppear { model.refreshCacheState() }
+        .sheet(isPresented: $showCache) { CachedPasswordsView() }
     }
 
     var connectButton: some View {
